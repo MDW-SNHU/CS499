@@ -1,0 +1,410 @@
+# ---
+# MongoManager
+# ---
+#  
+# This class provides a full-featured Mongo database management library.  
+# This functionality offered by this class provides methods for:
+#
+#    > Authentication and connection to any Mongo instance
+#    > Database creation, deletion, listing, switching
+#    > Collection creation, deletion, listing, renaming
+#    > CRUD operations for any collection (which was the inital purpose of the class from which this derived)
+#    > Index creation, listing, deletion
+#    > Aggregation pipelines
+#    > Schema validation helpers
+#    > Backup/restore helpers (simple JSON-based)
+#    > Flexible function signatures with optional parameters
+#        
+# In order to function properly, access for and connection to an existing mongo installation is required.  A routine
+# to manage authentication and connection is available within the library.
+# ---
+# Version History:
+#     v0.1 - May 24, 2026 - Incorporated and updated AAC_CRUD_Operations.py written for CS340 adding more comprehensive set
+#                               of methods that are geared towards full database utility rather than only CRUD operations.
+# ---
+# Mark Woodford
+# SNHU CS499 Computer Science Capstone
+# May 24, 2026
+# ---
+
+from pymongo import MongoClient
+from pymongo.errors import ServerSelectionTimeoutError
+from bson.objectid import ObjectId
+from datetime import datetime
+
+class MongoManager(object):
+
+    def __new__(cls, *args, **kwargs):
+        # Create a new instance of MongoManager, which then will pick up necessary class variables from __init__
+        instance = super().__new__(cls)
+        return instance
+
+    def __init__(self):
+        # The init routine defines necessary class variables.  Values are provided and updated
+        #     by class functions but initialized as appropriate here.
+        self.mm_client = None
+        self.mm_database = None
+        self.mm_collection = None
+        self.authenticated = False
+
+    # ---
+    # Authentication
+    # ---
+    def authenticate(self, username=None, password=None, host="127.0.0.1", port=27017, database=None, timeout=3000):
+        # Function establishes a connection to a MongoDB instance and selects a database.
+        #     Not all parameters are necessary, depending on what functions are being performed.
+        #     If unspecified, port will default to 27017, the standard MongoDB port and
+        #     host will default to 127.0.0.1, which is the local host.  If no security is enabled then
+        #     username and password fields are not required and if database is not specified there will 
+        #     be none used.  This will allow for database creation, deletion, switching and listing without issue.
+        #     If username, password, and database are omitted, the main Mongo instance running on the specified host and port
+        #     (or 127.0.0.1:27017) will be connected.
+
+        # Build connection URI depending on what parameters are provided to the function call.
+        if username and password:
+            # Connection being made to a secured mongo instance, provide appropriate uri to handle that.w
+            MongoURI = f"mongodb://{username}:{password}@{host}:{port}"
+        else:
+            # instance is being dealth with as unsecured, no username/password specified in URI.  Should cause auth issue if auth is required.
+            MongoURI = f"mongodb://{host}:{port}"
+
+        try:
+            self.mm_client = MongoClient(MongoURI, serverSelectionTimeoutMS=timeout)
+
+            # test that we got properly connected
+            self.mm_client.admin.command("ping")
+
+            self.mm_database = self.mm_client[database]
+            self.authenticated = True
+
+        except ServerSelectionTimeoutError:
+            raise Exception("Authentication failed: Timed out trying to reach server.")
+        except Exception as e:
+            raise Exception(f"Authentication failed: {str(e)}")
+
+    # ---
+    # Database Management
+    # ---
+    # The functions in this section manage database creation, listing, removal, and use.
+    # ---
+    def list_databases(self):
+        self._check_auth()
+        return self.mm_client.list_database_names()
+
+    def create_database(self, database_name=None):
+        # Since MongoDB is indifferent about database creation, and will create database on the fly,
+        # We can just create a collection that exists in the new database and put something marginally useful it.
+        # The collection can later be dropped if it isn't desired.
+        self._check_auth()
+        if not database_name:
+            raise Exception("A database name required in order to create it.")
+        # Check to see if DB already exists and, if so, simply return True.  If not, create a collection and stick the 
+        #    creation date in there.
+        if database_name in self.mm_client.list_database_names():
+            return True 
+        else:
+            db = self.mm_client[database_name]
+            db["creation_date"].insert_one({"created": datetime.utcnow()})
+        return True
+
+    def drop_database(self, database_name=None):
+        self._check_auth()
+        if not database_name:
+            raise Exception("Database name required.")
+        self.mm_client.drop_database(database_name)
+        return True
+
+    def use_database(self, database_name=None):
+        # This routine will set the active database name for use with non-database functions 
+        self._check_auth()
+        if not database_name:
+            raise Exception("Database name required.")
+        self.mm_database = self.mm_client[database_name]
+        return True
+
+    # ---
+    # Collection Management
+    # ---
+    # The functions in this section will assist in collection management.  Operations include
+    #     listing, creating, renaming, removing, and using.
+    # ---
+    def list_collections(self):
+        self._check_auth()
+        return self.mm_database.list_collection_names()
+
+    def create_collection(self, collection_name=None, schema_specs=None):
+        # Collection creation, like database creation, is very much ad-hoc in MongoDB.
+        #  the optional variable schema_specs allows specifying a JSON schema for validating the collection
+        self._check_auth()
+        if not collection_name:
+            raise Exception("Collection name required.")
+
+        create_options = {}
+        if schema_specs:
+            create_options["schema_specs"] = schema_specs
+
+        self.mm_database.create_collection(collection_name, **create_options)
+        return True
+
+    def drop_collection(self, collection_name=None):
+        # There is no validation performed to determine if dropping a collection is really desired, the expectation
+        #    is that if any validation is desired it will be added to the application using the class.
+        self._check_auth()
+        if not collection_name:
+            raise Exception("A collection name is required to determine what to drop.")
+        self.mm_database.drop_collection(collection_name)
+        return True
+
+    def rename_collection(self, old_name=None, new_name=None):
+        self._check_auth()
+        if not old_name or not new_name:
+            raise Exception("Old and new collection names are required for rename operation.")
+        self.mm_database[old_name].rename(new_name)
+        return True
+
+    def set_collection(self, collection_name=None):
+        # This function is used to set the collection name for use by other class functions.
+        self._check_auth()
+        if not collection_name:
+            raise Exception("Collection name was not specified for set operation.")
+        self.mm_collection = self.mm_database[collection_name]
+        return True
+
+
+    # ---
+    # CRUD Operations
+    # ---
+    # The functions below are 'per collection' operations.  They provide the ability to create, read, write, or delete from
+    #     a specific collction.  If the collection has not been specified, operations will return an error.
+    # ---
+
+    def create(self, data=None):
+        # Create method (Putting the C in CRUD)
+        # returns the object id of the created record.
+        self._verify_collection()
+        if not data:
+            raise Exception("Data required for create().")
+        result = self.mm_collection.insert_one(data)
+        return str(result.inserted_id)
+
+    def create_many(self, records=None):
+        # Create Many method (Bulk Insert) -- This is a new addition to the CRUD routines to allow multiple records
+        #    from a list of JSON documents to be inserted at the same time. 
+        #    Any "_id" fields found in the incoming documents will be removed to avoid duplicate key errors.
+        # Return will be a count of records inserted.
+
+        # First ensure that there is collection to insert into
+        self._verify_collection()
+
+        # Raise an exception if records were not supplied or if the supplied records aren't a list.
+        if records is None:
+            raise Exception("Error in create_many(): A list of records must be supplied.")
+
+        if not isinstance(records, list):
+            raise Exception("Error in create_many(): The records parameter must be a python list of JSON documents.")
+
+        # Remove any "_id" fields to avoid duplicate key conflicts and verify records in the list are of type dict
+        cleaned_records = []
+        for doc in records:
+            if not isinstance(doc, dict):
+                raise Exception("Error in create_many(): Each record must be a dictionary.")
+            cleaned = {}
+            for k, v in doc.items():
+                if k != "_id":
+                    cleaned[k] = v
+            cleaned_records.append(cleaned)
+
+        # Perform the bulk insert. 
+        ### Note: there is no verification that the fields are consistent across records.
+        ###    Mongo won't take steps to verify that the fields are consistent with expected or existing
+        ###    fields in a collection as a SQL based language would.  Any field given will simply be created
+        ###    as it is encountered, and missing fields will not be noticed without specific configuration added to the
+        ###    collection to validate records. 
+        result = self.mm_collection.insert_many(cleaned_records)
+        return len(result.inserted_ids)
+
+    def read(self, filter_dict=None, selection_dict=None, options_dict=None):
+        # Read method (Adding the R to CRUD)
+        # Returns the object ids of the documents retrieved by the find.
+        self._verify_collection()
+        filter_dict = filter_dict or {}
+        options_dict = options_dict or {}
+        cursor = self.mm_collection.find(filter_dict, selection_dict)
+        return self._apply_options(cursor, options_dict)
+
+    def update(self, filter_dict=None, update_dict=None):
+        # Update method (Can't spell CRUD without U)
+        # Returns a count of records updated.
+        self._verify_collection()
+        if not filter_dict or not update_dict:
+            raise Exception("filter_dict and update_dict required.")
+        result = self.mm_collection.update_many(filter_dict, {"$set": update_dict})
+        return result.modified_count
+
+    def delete(self, filter_dict=None):
+        # Delete method (finishing off the CRUD)
+        # The delete option doesn't provide any verification as to whether the records really are the ones to be deleted.
+        #    It is expected that the application that includes the class will provide for any verification desired.
+        # Returns a count of records deleted.
+        self._verify_collection()
+        if not filter_dict:
+            raise Exception("filter_dict is required for delete in order that the target records can be determined.")
+        result = self.mm_collection.delete_many(filter_dict)
+        return result.deleted_count
+
+
+    # ---
+    # Index Management
+    # ---
+    # Functions in this section allow for creation, deletion, and listing of indexes for the currently selected collection.
+    # ---
+
+    def list_indexes(self):
+        self._verify_collection()
+        return list(self.mm_collection.list_indexes())
+
+    def create_index(self, req: dict):
+        self._check_auth()
+
+        fields = req.get("fields", [])
+        unique = req.get("unique", False)
+
+        if len(fields) == 0:
+            raise("create_index requires a field name for the index and a direction (asc/desc)")
+
+        index_spec = []
+
+        for field in fields:
+            name = field.get("name")
+            direction = field.get("direction", "asc")
+
+            if not name:
+                raise ValueError("Index field missing 'name'")
+
+            if direction == "asc":
+                dir_value = 1
+            else: 
+                dir_value = -1
+            index_spec.append((name, dir_value))
+
+        return self.mm_collection.create_index(index_spec, unique=unique)
+
+    def drop_index(self, index_name=None):
+        # Dropping an index isn't as destructive as dropping a db or record, but it still should be noted
+        #    that there is no verification for dropping the index.  If verification is desired it should be handled
+        #    in the application that includes the class.
+        self._verify_collection()
+        if not index_name:
+            raise Exception("The index name is necessary in order to perform drop operation.")
+        self.mm_collection.drop_index(index_name)
+        return True
+
+
+    # ---
+    # Aggregation
+    # ---
+    # The aggregate function will allow for operations to be 'piped' together for use in data grouping and analysis.  The parameter
+    #     'pipeline' is expected to be a list of dicts which specify the operations to be used, in the order they should be executed in.
+    #     Example:
+    #         pipeline = [{"$match": {"job_status": "full-time"}}, {"$group": {"_id": null, total: {"$sum": salary}}}] 
+    #     It is left to the application including the class to compose the desired aggregation pipeline.
+    # ---
+    def aggregate(self, pipeline=None):
+        self._verify_collection()
+        if not pipeline:
+            raise Exception("In order to perform aggregation a pipeline is required.")
+        cursor = self.mm_collection.aggregate(pipeline)
+        return [self._id_to_string(doc) for doc in cursor]
+
+    # ---
+    # Backup / Restore (Simple JSON-based)
+    # ---
+    # Backup and restore operations for collections.  These operations were added to enhance the management aspects of the class
+    #    but aren't yet thoroughly tested.  
+    # ---
+  
+    def backup_collection(self):
+        # Backup is simply a 'find' of all records in the specified collection.
+        # Returns a list of the ids of the records converted to string
+        self._verify_collection()
+        cursor = self.mm_collection.find({})
+        return [self._id_to_string(doc) for doc in cursor]
+
+    def restore_collection(self, documents=None, drop_first=False):
+        # Dropping the existing collection is an option (specified in drop_first) rather than a definite.  Function will
+        #    accept a list of documents, remove the id of the document from the documents to be restored, and then insert the
+        #    resulting 'cleaned' list into the current database.  If 'drop_first' is specified the function will drop and recreate the
+        #    collection before the insertion so that the collection is empty before the insertion is performed.
+        # Returns the number of records inserted into the collection.
+        self._verify_collection()
+        if drop_first:
+            self.mm_collection.drop()
+            self.mm_database.create_collection(self.mm_collection.name)
+
+        if not documents:
+            return 0
+
+        # Remove _id to avoid conflicts
+        clean_docs = []
+        for doc in documents:
+            cleaned = {}
+            for k, v in doc.items():
+                if k != "_id":
+                    cleaned[k] = v
+            clean_docs.append(cleaned)        
+        result = self.mm_collection.insert_many(clean_docs)
+        return len(result.inserted_ids)
+
+    # ---
+    # Helper functions.  Perform operations necessary for stable operations
+    # ---
+    # The functions in this section are used internally in the class to simplify the class functions and make
+    #    the code cleaner and easier to understand.
+    # ---
+    def _check_auth(self):
+        if not self.authenticated:
+            raise Exception("Authentication required. Call authenticate().")
+
+    def _verify_collection(self):
+        self._check_auth()
+        if self.mm_collection is None:
+            raise Exception("No collection selected. Call set_collection().")
+
+    def _id_to_string(self, doc):
+        # simple function to convert ObjectId to string for processing
+        if "_id" in doc:
+            doc["_id"] = str(doc["_id"])
+        return doc
+
+    def _apply_options(self, cursor, options_dict):
+        """
+        Applies sort, limit, skip, and other future options to a MongoDB cursor,
+        then converts ObjectId fields to strings before returning results.
+        """
+
+        # Sorting
+        if "sort" in options_dict and options_dict["sort"]:
+            sort_dict = options_dict["sort"]
+            sort_list = list(sort_dict.items())
+            cursor = cursor.sort(sort_list)
+    
+        # Limit
+        if "limit" in options_dict and options_dict["limit"]:
+            cursor = cursor.limit(options_dict["limit"])
+    
+        # Skip (OFFSET)
+        if "skip" in options_dict and options_dict["skip"]:
+            cursor = cursor.skip(options_dict["skip"])
+    
+        # Distinct (future feature)
+        if "distinct" in options_dict and options_dict["distinct"]:
+            field_name = options_dict["distinct"]
+            distinct_values = cursor.distinct(field_name)
+            return [self._convert_id_if_needed(value) for value in distinct_values]
+    
+        # Convert all documents
+        cleaned_docs = []
+        for document in cursor:
+            cleaned_docs.append(self._id_to_string(document))
+
+        return cleaned_docs
