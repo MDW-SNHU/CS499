@@ -489,17 +489,21 @@ def execute_sql_query(sql_query: str):
     if func_to_execute:
         sql_string = "SQL Query: " + sql_query
         ret_string = "Mongo Translation: db." + collection + "." + operation
-        if translation["filter"]:
-            ret_string += str(translation["filter"])
-        if translation["projection"]:
-            ret_string += str(translation["projection"])
-        if translation["sort"] or translation["limit"]:
-            ret_string += "{"
-            if translation["sort"]:
-                ret_string += str(translation.get("sort"))
-            if translation["limit"]:
-                ret_string += str(translation.get("limit"))
-            ret_string += "}"
+        if operation != "aggregate" and operation != "update":
+            if translation["filter"]:
+                ret_string += str(translation["filter"])
+            if translation["projection"]:
+                ret_string += str(translation["projection"])
+            if translation["sort"] or translation["limit"]:
+                ret_string += "{"
+                if translation["sort"]:
+                    ret_string += str(translation.get("sort"))
+                if translation["limit"]:
+                    ret_string += str(translation.get("limit"))
+                ret_string += "}"
+        if operation == "aggregate":
+            if translation["pipeline"]:
+                ret_string += "(" + str(translation["pipeline"]) + ")"
         if operation == "update":
             if translation["update"]:
                 ret_string += str(translation["update"])
@@ -518,7 +522,7 @@ app.include_router(router)
 if __name__ == "__main__":
     keyfile = home_dir + "/security/key.pem"
     certfile = home_dir + "/security/cert.pem"
-    if Path(keyfile).exists() and Path(certfile).exits():
+    if Path(keyfile).exists() and Path(certfile).exists():
         uvicorn.run("MongoManager_SwaggerUI:app", 
             host="0.0.0.0", 
             port=8000, 
