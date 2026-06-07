@@ -447,6 +447,8 @@ def restore_collection(req: RestoreRequest):
 
 @router.post("/sql/execute", tags=["SQL Helper"])
 def execute_sql_query(sql_query: str):
+    func_to_execute = False
+
     translation = translator.translate_sql(sql_query)
 
     operation = translation["operation"]
@@ -458,28 +460,53 @@ def execute_sql_query(sql_query: str):
             "sort": translation.get("sort"),
             "limit": translation.get("limit"),
         }
-        return manager.read(
+        func_to_execute = True
+        retval = (manager.read( 
             translation["filter"],
             translation["projection"],
             options_dict
-        )
+        ))
 
     if operation == "create":
-        return manager.create(translation["document"])
+        func_to_execute = True
+        retval = (manager.create(translation["document"]))
 
     if operation == "update":
-        return manager.update(
+        func_to_execute = True
+        retval = (manager.update(
             translation["filter"],
             translation["update"]
-        )
+        ))
 
     if operation == "delete":
-        return manager.delete(translation["filter"])
+        func_to_execute = True
+        retval = (manager.delete(translation["filter"]))
 
     if operation == "aggregate":
-        return manager.aggregate(translation["pipeline"])
+        func_to_execute = True
+        retval = (manager.aggregate(translation["pipeline"]))
 
-    return {"error": "Unsupported operation"}
+    if func_to_execute:
+        sql_string = "SQL Query: " + sql_query
+        ret_string = "Mongo Translation: db." + collection + "." + operation
+        if translation["filter"]:
+            ret_string += str(translation["filter"])
+        if translation["projection"]:
+            ret_string += str(translation["projection"])
+        if translation["sort"] or translation["limit"]:
+            ret_string += "{"
+            if translation["sort"]:
+                ret_string += str(translation.get("sort"))
+            if translation["limit"]:
+                ret_string += str(translation.get("limit"))
+            ret_string += "}"
+        if operation == "update":
+            if translation["update"]:
+                ret_string += str(translation["update"])
+        return [sql_string, ret_string, retval]
+    else: 
+        return {"error": "Unsupported operation"}
+
 app.include_router(router)
 
 # Now that app is fully defined (with all the appropriate URI info incorporated and with the SQL translator installed
