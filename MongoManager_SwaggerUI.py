@@ -31,11 +31,16 @@ from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, Dict, List, Optional
 from functools import lru_cache
+from pathlib import Path
 import uvicorn
 import json
+import os
 
 from MongoManager import MongoManager
 from SQLtoMongo import SQLToMongoTranslator
+
+# Get the path from which the script is being executed in case we need locally stored files nearby...  
+home_dir = os.path.dirname(os.path.abspath(__file__))
 
 app = FastAPI(
     title="Mongo Manager API",
@@ -484,4 +489,15 @@ app.include_router(router)
 #    mostly intended if development work on the scripts.
 #
 if __name__ == "__main__":
-    uvicorn.run("MongoManager_SwaggerUI:app", host="0.0.0.0", port=8000, reload=True)
+    keyfile = home_dir + "/security/key.pem"
+    certfile = home_dir + "/security/cert.pem"
+    if Path(keyfile).exists() and Path(certfile).exits():
+        uvicorn.run("MongoManager_SwaggerUI:app", 
+            host="0.0.0.0", 
+            port=8000, 
+            reload=True, 
+            ssl_keyfile=keyfile,
+            ssl_certfile=certfile
+        )
+    else:
+        uvicorn.run("MongoManager_SwaggerUI:app", host="0.0.0.0", port=8000, reload=True)
