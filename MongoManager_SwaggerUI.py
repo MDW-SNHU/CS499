@@ -489,24 +489,28 @@ def execute_sql_query(sql_query: str):
     if func_to_execute:
         sql_string = "SQL Query: " + sql_query
         ret_string = "Mongo Translation: db." + collection + "." + operation
-        if operation != "aggregate" and operation != "update":
+        if operation == "read" or operation == "update" or operation == "delete":
             if translation["filter"]:
                 ret_string += str(translation["filter"])
-            if translation["projection"]:
-                ret_string += str(translation["projection"])
-            if translation["sort"] or translation["limit"]:
-                ret_string += "{"
-                if translation["sort"]:
-                    ret_string += str(translation.get("sort"))
-                if translation["limit"]:
-                    ret_string += str(translation.get("limit"))
-                ret_string += "}"
+            if operation == "update":
+                if translation["update"]:
+                    ret_string += str(translation["update"])
+            elif operation == "read":
+                if translation["projection"]:
+                    ret_string += str(translation["projection"])
+                if translation["sort"] or translation["limit"]:
+                    ret_string += "{"
+                    if translation["sort"]:
+                        ret_string += str(translation.get("sort"))
+                    if translation["limit"]:
+                        ret_string += str(translation.get("limit"))
+                    ret_string += "}"
+        if operation == "create":
+            if translation["document"]:
+                ret_string += str(translation["document"])
         if operation == "aggregate":
             if translation["pipeline"]:
                 ret_string += "(" + str(translation["pipeline"]) + ")"
-        if operation == "update":
-            if translation["update"]:
-                ret_string += str(translation["update"])
         return [sql_string, ret_string, retval]
     else: 
         return {"error": "Unsupported operation"}
