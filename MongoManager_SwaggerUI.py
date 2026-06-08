@@ -268,10 +268,48 @@ def set_collection(req: CollectionRequest):
 # First, the pydantic models for dealing with documents.  Create accepts a json Dict, CreateMany is a list json Dicts, and 
 #    Query is used for read (find) operations.
 class DocumentCreate(BaseModel):
-    data: Dict[str, Any]
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        json_schema_extra={
+            "example": {
+                "date": "2020-01-01",
+                "song": "Some Song Name",
+                "artist": "Some Singer",
+                "this_week": 1,
+                "last_week": 2,
+                "peak_position": 1,
+                "weeks_on_chart": 2
+            }
+        }
+    )
 
 class DocumentCreateMany(BaseModel):
-    records: List[Dict[str, Any]]
+    records: List[Dict[str, Optional[Any]]] = Field(
+        default_factory=list,
+        json_schema_extra={
+            "example": [
+                {
+                    "date": "2020-01-01",
+                    "song": "Some Song Name",
+                    "artist": "Some Singer",
+                    "this_week": 1,
+                    "last_week": 2,
+                    "peak_position": 1,
+                    "weeks_on_chart": 2
+                },
+                {
+                    "date": "2020-01-01",
+                    "song": "Some Other Song Name",
+                    "artist": "Some Other Singer",
+                    "this_week": 2,
+                    "last_week": 3,
+                    "peak_position": 2,
+                    "weeks_on_chart": 2
+                }
+            ],
+            "additionalProperties": False
+        }
+    )
 
 class DocumentQuery(BaseModel):
     # Both fields being 'Optional' causes Swagger to send a garbage field 'additionalProp1' which is default and causes an error
@@ -283,6 +321,22 @@ class DocumentUpdate(BaseModel):
     filter: Dict[str, Any]
     update_dict: Dict[str, Any]
 
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "filter": {
+                    "artist": "Some Singer",
+                    "song": "Some Song Name"
+                },
+                "update": {
+                    "$set": {
+                        "weeks_on_chart": 1001,
+                        "peak_position": 1
+                    }
+                }
+            }
+        }
+    }
 # ---
 # CRUD Endpoints
 # ---
@@ -415,7 +469,28 @@ def drop_index(req: IndexDrop):
 #    entering a list of aggregation options for execution in sequence.
 # ---
 class AggregationRequest(BaseModel):
-    pipeline: List[Dict[str, Any]]
+    pipeline: List[Dict[str, Any]] = Field(
+        default_factory=dict,
+        json_schema_extra={
+            "example": [
+                {
+                    "$match": {
+                        "artist": "Some Singer",
+                        "weeks_on_chart": { "$gte": 10 }
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$artist",
+                        "total_weeks": { "$sum": "$weeks_on_chart" },
+                    }
+                },
+                {
+                    "$limit": 5
+                }
+            ]
+        }
+    )
 
 @app.post("/aggregation/run", tags=["Aggregation"], summary="Run aggregation pipeline")
 def run_aggregation(req: AggregationRequest):
