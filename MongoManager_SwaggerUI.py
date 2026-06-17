@@ -49,7 +49,6 @@ app = FastAPI(
 )
 
 router = APIRouter()
-translator = SQLToMongoTranslator()
 
 # Ensure that the MongoManager is single-threaded.  We don't want to have to manage logins
 # multiple times or deal with threads that can't figure out that they're not currently
@@ -59,6 +58,8 @@ translator = SQLToMongoTranslator()
 def get_manager():
     return MongoManager()
 manager = get_manager()
+
+translator = SQLToMongoTranslator(manager)
 
 # ---
 # About Endpoint
@@ -520,76 +521,41 @@ def backup_collection():
 def restore_collection(req: RestoreRequest):
     return manager.restore_collection(req.documents, req.drop_first)
 
-@router.post("/sql/execute", tags=["SQL Helper"])
-def execute_sql_query(sql_query: str):
-    func_to_execute = False
+# ---
+# The below section implements the SQL translation piece of the UI.  The return from this
+#    translation is rather flexible.  The idea is to include both the given SQL query string and the resulting Mongo
+#    translation, then append to that the results of the executed query.  The actual translation mechanics are implemented in
+#    the included SQLtoMongo class.
+# ---
 
+class SQLExecutionResponse(BaseModel):
+    sql: str
+    translation: str
+    result: Any
+
+@router.post("/sql/execute", tags=["SQL Helper"], response_model=SQLExecutionResponse)
+def execute_sql_query(sql_query: str):
+    # New translator already EXECUTES the SQL and returns:
+    #   { "sql": ..., "mongo_plan": ..., "result": ... }
     translation = translator.translate_sql(sql_query)
 
-    operation = translation["operation"]
-    collection = translation["collection"]
-    manager.set_collection(collection)
+    sql_string = translation["sql"]
+    mongo_plan = translation["mongo_plan"]
+    result = translation["result"]
 
-    if operation == "read":
-        options_dict = {
-            "sort": translation.get("sort"),
-            "limit": translation.get("limit"),
-        }
-        func_to_execute = True
-        retval = (manager.read( 
-            translation["filter"],
-            translation["projection"],
-            options_dict
-        ))
+    # For backward compatibility with your UI, we map:
+    #   translation -> mongo_plan
+    #   result      -> result
+    #   sql         -> sql
+    return SQLExecutionResponse(
+        sql=sql_string,
+        translation=mongo_plan,
+        result=result
+    )
 
-    if operation == "create":
-        func_to_execute = True
-        retval = (manager.create(translation["document"]))
-
-    if operation == "update":
-        func_to_execute = True
-        retval = (manager.update(
-            translation["filter"],
-            translation["update"]
-        ))
-
-    if operation == "delete":
-        func_to_execute = True
-        retval = (manager.delete(translation["filter"]))
-
-    if operation == "aggregate":
-        func_to_execute = True
-        retval = (manager.aggregate(translation["pipeline"]))
-
-    if func_to_execute:
-        sql_string = "SQL Query: " + sql_query
-        ret_string = "Mongo Translation: db." + collection + "." + operation
-        if operation == "read" or operation == "update" or operation == "delete":
-            if translation["filter"]:
-                ret_string += str(translation["filter"])
-            if operation == "update":
-                if translation["update"]:
-                    ret_string += str(translation["update"])
-            elif operation == "read":
-                if translation["projection"]:
-                    ret_string += str(translation["projection"])
-                if translation["sort"] or translation["limit"]:
-                    ret_string += "{"
-                    if translation["sort"]:
-                        ret_string += str(translation.get("sort"))
-                    if translation["limit"]:
-                        ret_string += str(translation.get("limit"))
-                    ret_string += "}"
-        if operation == "create":
-            if translation["document"]:
-                ret_string += str(translation["document"])
-        if operation == "aggregate":
-            if translation["pipeline"]:
-                ret_string += "(" + str(translation["pipeline"]) + ")"
-        return [sql_string, ret_string, retval]
-    else: 
-        return {"error": "Unsupported operation"}
-
+# ---
+# Include the router (required to execute the SQL translation) in the app definition before starting the app.
+# ---
 app.include_router(router)
 
 # Now that app is fully defined (with all the appropriate URI info incorporated and with the SQL translator installed

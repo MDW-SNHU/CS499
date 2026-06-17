@@ -83,6 +83,34 @@ class MongoManager(object):
             raise Exception(f"Authentication failed: {str(e)}")
 
     # ---
+    # This method is used to detect whether the authenticated account has only read access or whether
+    #    it can create temporary databases for nested searches and more complex operations.  It was 
+    #    added specifically for the SQLtoMongo functionality as SQL statements can become complex and
+    #    when translated to Mongo methods using temporary storage for nested selects or complex 
+    #    where clauses becomes a near necessity to protect against exceeding memory constraints.
+    # ---
+    def is_read_only(self):
+        try:
+            status = self.mm_database.command("connectionStatus")
+            privileges = status["authInfo"]["authenticatedUserPrivileges"]
+
+            write_actions = {
+                "insert", "update", "remove",
+                "createCollection", "dropCollection", "dropDatabase"
+            }
+
+            for priv in privileges:
+                actions = set(priv.get("actions", []))
+                if actions & write_actions:
+                    return False  # user has at least one write privilege
+
+            return True  # no write privileges found
+
+        except Exception:
+            # If we cannot determine, assume read-only for safety
+            return True
+
+    # ---
     # Database Management
     # ---
     # The functions in this section manage database creation, listing, removal, and use.
