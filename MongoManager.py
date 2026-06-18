@@ -107,8 +107,8 @@ class MongoManager(object):
             return True  # no write privileges found
 
         except Exception:
-            # If we cannot determine, assume read-only for safety
-            return True
+            # If we cannot determine, assume we're not read-only.  Commonly this occurs when there is no authentication required.
+            return False
 
     # ---
     # Database Management

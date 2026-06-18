@@ -140,6 +140,10 @@ def authenticate(credentials: Credentials):
         "secure": secured
     }
 
+@app.post("/readonly", tags=["Authentication"], summary="Check to see if authenticated account is in read-only mode")
+def check_readonly():
+    return {"readonly": manager.is_read_only()}
+
 # ---
 # Authentication Form Page
 # ---
