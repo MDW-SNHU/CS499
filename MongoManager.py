@@ -356,7 +356,10 @@ class MongoManager(object):
         # Returns a list of the ids of the records converted to string
         self._verify_collection()
         cursor = self.mm_collection.find({})
-        return [self._id_to_string(doc) for doc in cursor]
+        cleaned = []
+        for doc in cursor:
+            cleaned.append(self._convert_ids_deep(doc))
+        return cleaned
 
     def restore_collection(self, documents=None, drop_first=False):
         # Dropping the existing collection is an option (specified in drop_first) rather than a definite.  Function will
@@ -436,3 +439,23 @@ class MongoManager(object):
             cleaned_docs.append(self._id_to_string(document))
 
         return cleaned_docs
+
+def _convert_ids_deep(self, value):
+    from bson.objectid import ObjectId
+
+    if isinstance(value, ObjectId):
+        return str(value)
+
+    if isinstance(value, dict):
+        new_doc = {}
+        for k, v in value.items():
+            new_doc[k] = self._convert_ids_deep(v)
+        return new_doc
+
+    if isinstance(value, list):
+        new_list = []
+        for item in value:
+            new_list.append(self._convert_ids_deep(item))
+        return new_list
+
+    return value
