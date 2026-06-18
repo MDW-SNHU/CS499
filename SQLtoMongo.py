@@ -38,6 +38,7 @@
 #       LIGHT = high-level logging
 #       DEBUG = deep internal logging
 
+from ast import stmt
 import os
 import re
 import uuid
@@ -45,6 +46,8 @@ from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, List, Optional, Dict
+
+from bson import ObjectId
 
 
 # ============================================================
@@ -167,6 +170,29 @@ class InSubqueryExpr:
     field: str
     subquery: SelectStmt
 
+@dataclass
+class DescribeStmt:
+    table: str
+
+@dataclass
+class HelpStmt:
+    topic: Optional[str]  # e.g., SELECT, INSERT, or None for general help
+
+@dataclass
+class DropTableStmt:
+    table: str
+
+@dataclass
+class ShowTablesStmt:
+    pass
+
+@dataclass
+class ShowDatabasesStmt:
+    pass
+
+@dataclass
+class ShowIndexesStmt:
+    table: str
 
 # ============================================================
 # LEXER
@@ -205,7 +231,9 @@ class Lexer:
                 if upper in [
                     "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "OFFSET",
                     "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
-                    "DISTINCT", "AND", "OR", "LIKE", "IN", "ASC", "DESC"
+                    "DISTINCT", "AND", "OR", "LIKE", "IN", "ASC", "DESC",
+                    "DESCRIBE", "HELP", "DROP", "TABLE",
+                    "SHOW", "TABLES", "DATABASES", "INDEXES", "FROM"
                 ]:
                     toks.append(Token(TokenType.KEYWORD, upper, start))
                 else:
@@ -315,6 +343,14 @@ class Parser:
                 return self.parse_update()
             if tok.value == "DELETE":
                 return self.parse_delete()
+            if tok.value == "DROP":
+               return self.parse_drop_table()
+            if tok.value == "SHOW":
+                return self.parse_show()
+            if tok.value == "DESCRIBE":
+                return self.parse_describe()
+            if tok.value == "HELP":
+                return self.parse_help()
         raise Exception(f"Unsupported SQL command: {tok.value}")
 
     # ------------------------------------------------------------
@@ -581,7 +617,58 @@ class Parser:
             self.advance()
             where = self.parse_expr()
         return DeleteStmt(table=table, where=where)
+    
+    # ------------------------------------------------------------
+    # DROP TABLE
+    # ------------------------------------------------------------
+    def parse_drop_table(self) -> DropTableStmt:
+        self.expect_kw("DROP")
+        self.expect_kw("TABLE")
+        table = self.expect(TokenType.IDENT).value
+        return DropTableStmt(table=table)
+    
+    # ------------------------------------------------------------
+    # SHOW
+    # ------------------------------------------------------------ 
+    def parse_show(self):
+        self.expect_kw("SHOW")
 
+        # SHOW TABLES
+        if self.current().type == TokenType.KEYWORD and self.current().value == "TABLES":
+            self.advance()
+            return ShowTablesStmt()
+
+        # SHOW DATABASES
+        if self.current().type == TokenType.KEYWORD and self.current().value == "DATABASES":
+            self.advance()
+            return ShowDatabasesStmt()
+
+        # SHOW INDEXES FROM <table>
+        if self.current().type == TokenType.KEYWORD and self.current().value == "INDEXES":
+            self.advance()
+            self.expect_kw("FROM")
+            table = self.expect(TokenType.IDENT).value
+            return ShowIndexesStmt(table=table)
+
+        return "Unsupported SHOW command."
+    
+    # ------------------------------------------------------------
+    # DESCRIBE
+    # ------------------------------------------------------------
+    def parse_describe(self) -> str:
+        self.expect_kw("DESCRIBE")
+        table = self.expect(TokenType.IDENT).value
+        return DescribeStmt(table=table)
+    
+    # ------------------------------------------------------------
+    # HELP
+    # ------------------------------------------------------------
+    def parse_help(self) -> HelpStmt:
+        self.expect_kw("HELP")
+        topic = None
+        if (self.current().type == TokenType.KEYWORD and self.current().value not in ("EOF")):
+            topic = self.advance().value
+        return HelpStmt(topic=topic)
 # ============================================================
 # SQL ENGINE
 # ============================================================
@@ -596,7 +683,8 @@ class SQLToMongoTranslator:
             "SELECT", "FROM", "WHERE", "ORDER", "BY",
             "LIMIT", "OFFSET", "INSERT", "INTO", "VALUES",
             "UPDATE", "SET", "DELETE", "DISTINCT",
-            "AND", "OR", "LIKE", "IN", "ASC", "DESC"
+            "AND", "OR", "LIKE", "IN", "ASC", "DESC",
+            "DESCRIBE"
         ]
 
         self.read_only = False
@@ -715,6 +803,18 @@ class SQLToMongoTranslator:
             return self._execute_update(stmt)
         if isinstance(stmt, DeleteStmt):
             return self._execute_delete(stmt)
+        if isinstance(stmt, DropTableStmt):
+            return self._execute_drop_table(stmt)
+        if isinstance(stmt, ShowTablesStmt):
+            return self._execute_show_tables()
+        if isinstance(stmt, ShowDatabasesStmt):
+            return self._execute_show_databases()
+        if isinstance(stmt, ShowIndexesStmt):
+            return self._execute_show_indexes(stmt)
+        if isinstance(stmt, DescribeStmt):
+            return self._execute_describe(stmt)
+        if isinstance(stmt, HelpStmt):
+            return self._execute_help(stmt)
 
         raise Exception("Unsupported SQL statement type.")
 
@@ -842,10 +942,11 @@ class SQLToMongoTranslator:
                     seen.add(key)
                     unique_docs.append(row)
 
-            return unique_docs
+            return self._convert_object_ids(unique_docs)
 
         # 7. Projection / Aggregates
         final = self._apply_projection(stmt.fields, docs, plan)
+        final = self._convert_object_ids(final)
         return final
 
     # ------------------------------------------------------------
@@ -1121,7 +1222,171 @@ class SQLToMongoTranslator:
             "mongo_plan": f"delete_many(filter={mongo_filter})",
             "result": {"deleted": res.deleted_count}
         }
+    
+    def _execute_show_tables(self):
+        if self.mongo.mm_database is None:
+            return {
+                "sql": "SHOW TABLES",
+                "mongo_plan": "SHOW TABLES",
+                "result": "No active database selected."
+            }
 
+        tables = self.mongo.mm_database.list_collection_names()
+
+        return {
+            "sql": "SHOW TABLES",
+            "mongo_plan": "LIST COLLECTIONS",
+            "result": tables
+        }
+
+    def _execute_show_databases(self):
+        try:
+            dbs = self.mongo.mm_client.list_database_names()
+            return {
+                "sql": "SHOW DATABASES",
+                "mongo_plan": "LIST DATABASES",
+                "result": dbs
+            }
+        except Exception as e:
+            return {
+                "sql": "SHOW DATABASES",
+                "mongo_plan": "LIST DATABASES",
+                "result": f"Error listing databases: {str(e)}"
+            }
+        
+    def _execute_show_indexes(self, stmt: ShowIndexesStmt):
+        table = stmt.table
+
+        if self.mongo.mm_database is None:
+            return {
+                "sql": f"SHOW INDEXES FROM {table}",
+                "mongo_plan": "SHOW INDEXES",
+                "result": "No active database selected."
+            }
+
+        collections = self.mongo.mm_database.list_collection_names()
+        if table not in collections:
+            return {
+                "sql": f"SHOW INDEXES FROM {table}",
+                "mongo_plan": "SHOW INDEXES",
+                "result": f"Table '{table}' does not exist."
+            }
+
+        try:
+            idx = list(self.mongo.mm_database[table].list_indexes())
+            # Convert ObjectId inside index metadata
+            cleaned = []
+            for d in idx:
+                new_doc = {}
+                for k, v in d.items():
+                    if isinstance(v, ObjectId):
+                        new_doc[k] = str(v)
+                    else:
+                        new_doc[k] = v
+                cleaned.append(new_doc)
+
+            return {
+                "sql": f"SHOW INDEXES FROM {table}",
+                "mongo_plan": f"LIST INDEXES ON {table}",
+                "result": cleaned
+            }
+        except Exception as e:
+            return {
+                "sql": f"SHOW INDEXES FROM {table}",
+                "mongo_plan": "SHOW INDEXES",
+                "result": f"Error: {str(e)}"
+            }
+
+    def _execute_describe(self, stmt: DescribeStmt) -> Dict[str, Any]:
+        if stmt.table not in self.mongo.mm_database.list_collection_names():
+            return(f"Table '{stmt.table}' does not exist.")
+        coll = self.mongo.mm_database[stmt.table]
+        sample_doc = coll.find_one()
+        if sample_doc is None:
+            return {"sql": f"DESCRIBE {stmt.table}", "mongo_plan": "find_one()", "result": "Collection is empty"}
+        else:
+            fields = list(sample_doc.keys())
+            return {"sql": f"DESCRIBE {stmt.table}", "mongo_plan": "find_one()", "result": {"fields": fields}}
+        
+    def _execute_help(self, stmt: HelpStmt) -> Dict[str, Any]:
+        general_help = "Supported SQL commands: SELECT, INSERT, UPDATE, DELETE, DESCRIBE, HELP. Use HELP <COMMAND> for details."
+        if stmt.topic is None:
+            return {"sql": "HELP", "mongo_plan": "N/A", "result": general_help}
+        
+        topic = stmt.topic.upper()
+        if topic == "SELECT":
+            detail = "SELECT syntax: SELECT [DISTINCT] fields FROM source [WHERE condition] [ORDER BY fields] [LIMIT n] [OFFSET n]"
+        elif topic == "INSERT":
+            detail = "INSERT syntax: INSERT INTO table [(columns)] VALUES (values)"
+        elif topic == "UPDATE":
+            detail = "UPDATE syntax: UPDATE table SET column=value [, column=value ...] [WHERE condition]"
+        elif topic == "DELETE":
+            detail = "DELETE syntax: DELETE FROM table [WHERE condition]"
+        elif topic == "DESCRIBE":
+            detail = "DESCRIBE syntax: DESCRIBE table"
+        elif topic == "SHOW":
+            detail = "SHOW syntax: SHOW TABLES | SHOW DATABASES | SHOW INDEXES FROM table"
+        elif topic == "TABLES":
+            detail = "SHOW TABLES syntax: SHOW TABLES"
+        elif topic == "DATABASES":
+            detail = "SHOW DATABASES syntax: SHOW DATABASES"
+        elif topic == "INDEXES":
+            detail = "SHOW INDEXES syntax: SHOW INDEXES FROM table"
+        elif topic == "DROP":
+            detail = "DROP syntax: DROP TABLE table"
+        elif topic == "HELP":
+            detail = "HELP syntax: HELP [TOPIC]. If TOPIC is provided, shows details for that command. Otherwise, shows general help."
+        else:
+            detail = f"No help available for topic '{stmt.topic}'. {general_help}"
+        
+        return {"sql": f"HELP {stmt.topic}", "mongo_plan": "N/A", "result": detail}
+    
+    def _execute_drop_table(self, stmt: DropTableStmt) -> Dict[str, Any]:
+        table = stmt.table
+
+        # Ensure DB is selected
+        if self.mongo.mm_database is None:
+            return {
+                "sql": f"DROP TABLE {table}",
+                "mongo_plan": "DROP TABLE",
+                "result": "No active database selected."
+            }
+
+        # Check if collection exists
+        collections = self.mongo.mm_database.list_collection_names()    
+        if table not in collections:
+            return {
+                "sql": f"DROP TABLE {table}",
+                "mongo_plan": "DROP TABLE",
+                "result": f"Table '{table}' does not exist."
+            }
+
+        # Drop the collection
+        try:
+            self.mongo.mm_database.drop_collection(table)
+            return {
+                "sql": f"DROP TABLE {table}",
+                "mongo_plan": f"DROP COLLECTION {table}",
+                "result": f"Table '{table}' dropped."
+            }
+        except Exception as e:
+            return {
+                "sql": f"DROP TABLE {table}",
+                "mongo_plan": "DROP TABLE",
+                "result": f"Error dropping table: {str(e)}"
+            }
+
+    def _convert_object_ids(self, docs):
+        cleaned = []
+        for d in docs:
+            new_doc = {}
+            for k, v in d.items():
+                if isinstance(v, ObjectId):
+                    new_doc[k] = str(v)
+                else:
+                    new_doc[k] = v
+            cleaned.append(new_doc)
+        return cleaned
 # ============================================================
 # END OF SQLToMongoTranslator
 # ============================================================
