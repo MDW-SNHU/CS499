@@ -502,28 +502,86 @@ def run_aggregation(req: AggregationRequest):
     return manager.aggregate(req.pipeline)
 
 # ---
-# Backup / Restore
-# ---
-# Backup and restore are available to provide for a more complete set of DB management tools.
-#    Backup will return a list of records for a specified table while restore will provide two choices: 
-#    restore records completely (from a specified set of records) after deleting and recreating a table, or
-#    restore a set of records into a collection.  Id fields will be removed from the records so that there
-#    are no conflicting records in the provided list.
+# Backup / Restore (existing in-memory endpoints)
 # ---
 class RestoreRequest(BaseModel):
     documents: List[Dict[str, Any]]
     drop_first: bool = False
 
-# These functions are very basic, simply calling the corresping methods in the MongoManager class.  The functions may be
-#    extended in the future to allow for backup and restore to external files, as has been implemented for create_from_file in the
-#    CRUD routines.
-@app.get("/backup/collection", tags=["Backup"], summary="Backup collection")
+@app.get("/backup/collection", tags=["Backup"], summary="Backup collection (in-memory JSON)")
 def backup_collection():
     return manager.backup_collection()
 
-@app.post("/restore/collection", tags=["Backup"], summary="Restore collection")
+@app.post("/restore/collection", tags=["Restore"], summary="Restore collection (from JSON payload)")
 def restore_collection(req: RestoreRequest):
     return manager.restore_collection(req.documents, req.drop_first)
+
+# ---
+# Backup / Restore (File-based, JSON + GZIP)
+# ---
+
+class FileBackupRequest(BaseModel):
+    compress: bool = Field(
+        default=False,
+        description="If true, backup will be stored as gzipped JSON (.json.gz)."
+    )
+
+class FileRestoreRequest(BaseModel):
+    filename: str = Field(..., description="Backup filename to restore from (as listed by /backup/collection/list).")
+    drop_first: bool = Field(
+        default=False,
+        description="If true, drop and recreate the collection before restoring."
+    )
+
+class FileDeleteRequest(BaseModel):
+    filename: str = Field(..., description="Backup filename to delete.")
+
+@app.post("/backup/collection/to-file", tags=["Backup"], summary="Backup collection to file (JSON or GZIP)")
+def backup_collection_to_file(req: FileBackupRequest):
+    try:
+        info = manager.backup_to_file(compress=req.compress)
+        return info
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/backup/collection/list", tags=["Backup"], summary="List backup files")
+def list_backup_files():
+    try:
+        return manager.list_backup_files()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/backup/collection/download", tags=["Backup"], summary="Download a backup file")
+def download_backup_file(filename: str):
+    try:
+        backup_path = manager.backup_dir / filename
+        if not backup_path.exists():
+            raise HTTPException(status_code=404, detail="Backup file not found.")
+        return FileResponse(
+            path=str(backup_path),
+            filename=filename,
+            media_type="application/octet-stream"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/restore/collection/from-file", tags=["Restore"], summary="Restore collection from backup file")
+def restore_collection_from_file(req: FileRestoreRequest):
+    try:
+        result = manager.restore_from_file(req.filename, drop_first=req.drop_first)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/backup/collection/delete", tags=["Backup"], summary="Delete a backup file")
+def delete_backup_file(req: FileDeleteRequest):
+    try:
+        result = manager.delete_backup_file(req.filename)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ---
 # The below section implements the SQL translation piece of the UI.  The return from this

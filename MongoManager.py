@@ -31,6 +31,8 @@ from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
 from bson.objectid import ObjectId
 from datetime import datetime
+from pathlib import Path
+import os
 
 class MongoManager(object):
 
@@ -46,6 +48,11 @@ class MongoManager(object):
         self.mm_database = None
         self.mm_collection = None
         self.authenticated = False
+        # Backup directory (Option 3: env override, default ./backups)
+        self.backup_dir = Path(
+            os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups"))
+        )
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
 
     # ---
     # Authentication
@@ -350,10 +357,10 @@ class MongoManager(object):
     # Backup and restore operations for collections.  These operations were added to enhance the management aspects of the class
     #    but aren't yet thoroughly tested.  
     # ---
-  
+     # ---
+    # Backup / Restore (Simple JSON-based, in-memory)
+    # ---
     def backup_collection(self):
-        # Backup is simply a 'find' of all records in the specified collection.
-        # Returns a list of the ids of the records converted to string
         self._verify_collection()
         cursor = self.mm_collection.find({})
         cleaned = []
@@ -362,11 +369,6 @@ class MongoManager(object):
         return cleaned
 
     def restore_collection(self, documents=None, drop_first=False):
-        # Dropping the existing collection is an option (specified in drop_first) rather than a definite.  Function will
-        #    accept a list of documents, remove the id of the document from the documents to be restored, and then insert the
-        #    resulting 'cleaned' list into the current database.  If 'drop_first' is specified the function will drop and recreate the
-        #    collection before the insertion so that the collection is empty before the insertion is performed.
-        # Returns the number of records inserted into the collection.
         self._verify_collection()
         if drop_first:
             self.mm_collection.drop()
@@ -375,17 +377,193 @@ class MongoManager(object):
         if not documents:
             return 0
 
-        # Remove _id to avoid conflicts
         clean_docs = []
         for doc in documents:
             cleaned = {}
             for k, v in doc.items():
                 if k != "_id":
                     cleaned[k] = v
-            clean_docs.append(cleaned)        
+            clean_docs.append(cleaned)
         result = self.mm_collection.insert_many(clean_docs)
         return len(result.inserted_ids)
 
+    # ---
+    # Backup / Restore to/from files (JSON + GZIP)
+    # ---
+
+    def backup_to_file(self, compress: bool = False) -> dict:
+        """
+        Backup current collection to a file in backup_dir.
+        Returns metadata about the created backup.
+        """
+        self._verify_collection()
+
+        db_name = self.mm_database.name
+        coll_name = self.mm_collection.name
+
+        # Fetch documents and strip _id
+        docs = []
+        cursor = self.mm_collection.find({})
+        for doc in cursor:
+            cleaned = {}
+            for k, v in doc.items():
+                if k != "_id":
+                    cleaned[k] = self._convert_ids_deep(v)
+            docs.append(cleaned)
+
+        count = len(docs)
+        timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts_for_filename = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+        base_name = f"{db_name}_{coll_name}_{ts_for_filename}"
+        if compress:
+            filename = base_name + ".json.gz"
+            format_type = "json.gz"
+        else:
+            filename = base_name + ".json"
+            format_type = "json"
+
+        backup_path = self.backup_dir / filename
+
+        payload = {
+            "_meta": {
+                "database": db_name,
+                "collection": coll_name,
+                "count": count,
+                "timestamp": timestamp,
+                "format": format_type,
+            },
+            "documents": docs,
+        }
+
+        if compress:
+            with gzip.open(backup_path, "wt", encoding="utf-8") as f:
+                json.dump(payload, f)
+        else:
+            with backup_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+        size = backup_path.stat().st_size
+
+        return {
+            "filename": filename,
+            "size": size,
+            "count": count,
+            "timestamp": timestamp,
+            "format": format_type,
+        }
+
+    def restore_from_file(self, filename: str, drop_first: bool = False) -> dict:
+        """
+        Restore collection from a backup file in backup_dir.
+        Validates database/collection metadata and inserts documents.
+        """
+        self._verify_collection()
+
+        backup_path = self.backup_dir / filename
+        if not backup_path.exists():
+            raise Exception(f"Backup file not found: {filename}")
+
+        # Detect compression
+        is_gzip = filename.endswith(".gz")
+
+        if is_gzip:
+            with gzip.open(backup_path, "rt", encoding="utf-8") as f:
+                payload = json.load(f)
+        else:
+            with backup_path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+        meta = payload.get("_meta", {})
+        docs = payload.get("documents", [])
+
+        db_name = meta.get("database")
+        coll_name = meta.get("collection")
+
+        # Validate database/collection match
+        if db_name != self.mm_database.name:
+            raise Exception(
+                f"Backup database '{db_name}' does not match active database '{self.mm_database.name}'."
+            )
+        if coll_name != self.mm_collection.name:
+            raise Exception(
+                f"Backup collection '{coll_name}' does not match active collection '{self.mm_collection.name}'."
+            )
+
+        if drop_first:
+            self.mm_collection.drop()
+            self.mm_database.create_collection(self.mm_collection.name)
+
+        # Clean docs (remove _id if present)
+        clean_docs = []
+        for doc in docs:
+            cleaned = {}
+            for k, v in doc.items():
+                if k != "_id":
+                    cleaned[k] = v
+            clean_docs.append(cleaned)
+
+        if not clean_docs:
+            return {"restored": 0}
+
+        result = self.mm_collection.insert_many(clean_docs)
+        return {"restored": len(result.inserted_ids)}
+
+    def list_backup_files(self) -> list:
+        """
+        List backup files in backup_dir with basic metadata.
+        """
+        files_info = []
+        for path in self.backup_dir.iterdir():
+            if not path.is_file():
+                continue
+            if not (path.name.endswith(".json") or path.name.endswith(".json.gz")):
+                continue
+
+            # Try to read minimal metadata
+            try:
+                is_gzip = path.name.endswith(".gz")
+                if is_gzip:
+                    with gzip.open(path, "rt", encoding="utf-8") as f:
+                        payload = json.load(f)
+                else:
+                    with path.open("r", encoding="utf-8") as f:
+                        payload = json.load(f)
+
+                meta = payload.get("_meta", {})
+                files_info.append({
+                    "filename": path.name,
+                    "size": path.stat().st_size,
+                    "timestamp": meta.get("timestamp"),
+                    "database": meta.get("database"),
+                    "collection": meta.get("collection"),
+                    "count": meta.get("count"),
+                    "format": meta.get("format"),
+                })
+            except Exception:
+                # If metadata can't be read, still list the file with minimal info
+                files_info.append({
+                    "filename": path.name,
+                    "size": path.stat().st_size,
+                    "timestamp": None,
+                    "database": None,
+                    "collection": None,
+                    "count": None,
+                    "format": None,
+                })
+
+        return files_info
+
+    def delete_backup_file(self, filename: str) -> dict:
+        """
+        Delete a backup file from backup_dir.
+        """
+        backup_path = self.backup_dir / filename
+        if not backup_path.exists():
+            raise Exception(f"Backup file not found: {filename}")
+        backup_path.unlink()
+        return {"deleted": filename} 
+    
     # ---
     # Helper functions.  Perform operations necessary for stable operations
     # ---
