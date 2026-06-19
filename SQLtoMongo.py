@@ -1002,7 +1002,7 @@ class SQLToMongoTranslator:
         if isinstance(expr, CompareExpr):
             field = expr.field
             op = expr.op
-            val = expr.value
+            val = self._maybe_convert_objectid(field, expr.value)
             if op == "=":
                 return {field: val}
             if op == "<":
@@ -1309,7 +1309,7 @@ class SQLToMongoTranslator:
             return {"sql": f"DESCRIBE {stmt.table}", "mongo_plan": "find_one()", "result": {"fields": fields}}
         
     def _execute_help(self, stmt: HelpStmt) -> Dict[str, Any]:
-        general_help = "Supported SQL commands: SELECT, INSERT, UPDATE, DELETE, DESCRIBE, HELP. Use HELP <COMMAND> for details."
+        general_help = "Supported SQL commands: SELECT, INSERT, UPDATE, DELETE, DESCRIBE, SHOW, DROP, HELP. Use HELP <COMMAND> for details."
         if stmt.topic is None:
             return {"sql": "HELP", "mongo_plan": "N/A", "result": general_help}
         
@@ -1387,6 +1387,16 @@ class SQLToMongoTranslator:
                     new_doc[k] = v
             cleaned.append(new_doc)
         return cleaned
+    
+    def _maybe_convert_objectid(self, field, value):
+        if field == "_id" and isinstance(value, str):
+            if len(value) == 24:
+                try:
+                    return(ObjectId(value))
+                except Exception:
+                    return(value)
+        return value
+
 # ============================================================
 # END OF SQLToMongoTranslator
 # ============================================================

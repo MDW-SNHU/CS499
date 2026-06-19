@@ -26,7 +26,7 @@
 # ---
 
 from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form, APIRouter
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, Dict, List, Optional
