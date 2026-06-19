@@ -413,7 +413,8 @@ class MongoManager(object):
                         cleaned["_id"] = str(v)  # store as string for JSON safety
                     continue
                 cleaned[k] = self._convert_ids_deep(v)
-
+            docs.append(cleaned)
+            
         count = len(docs)
         timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         ts_for_filename = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
