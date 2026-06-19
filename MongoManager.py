@@ -392,7 +392,7 @@ class MongoManager(object):
     # Backup / Restore to/from files (JSON + GZIP)
     # ---
 
-    def backup_to_file(self, compress: bool = False) -> dict:
+    def backup_to_file(self, compress: bool = False, preserve_ids: bool = False) -> dict:
         """
         Backup current collection to a file in backup_dir.
         Returns metadata about the created backup.
@@ -408,9 +408,11 @@ class MongoManager(object):
         for doc in cursor:
             cleaned = {}
             for k, v in doc.items():
-                if k != "_id":
-                    cleaned[k] = self._convert_ids_deep(v)
-            docs.append(cleaned)
+                if k == "_id":
+                    if preserve_ids:
+                        cleaned["_id"] = str(v)  # store as string for JSON safety
+                    continue
+                cleaned[k] = self._convert_ids_deep(v)
 
         count = len(docs)
         timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -433,6 +435,7 @@ class MongoManager(object):
                 "count": count,
                 "timestamp": timestamp,
                 "format": format_type,
+                "preserve_ids": preserve_ids,
             },
             "documents": docs,
         }
@@ -454,12 +457,14 @@ class MongoManager(object):
             "format": format_type,
         }
 
-    def restore_from_file(self, filename: str, drop_first: bool = False) -> dict:
+    def restore_from_file(self, filename: str, drop_first: bool = False, preserve_ids: bool = False) -> dict:
         """
         Restore collection from a backup file in backup_dir.
         Validates database/collection metadata and inserts documents.
         """
         self._verify_collection()
+        meta_preserve = meta.get("preserve_ids", False)
+        preserve_ids = preserve_ids or meta_preserve
 
         backup_path = self.backup_dir / filename
         if not backup_path.exists():
@@ -495,13 +500,19 @@ class MongoManager(object):
             self.mm_collection.drop()
             self.mm_database.create_collection(self.mm_collection.name)
 
-        # Clean docs (remove _id if present)
+        # Clean docs (remove _id if present and preserve_ids not active)
         clean_docs = []
         for doc in docs:
             cleaned = {}
             for k, v in doc.items():
-                if k != "_id":
-                    cleaned[k] = v
+                if k == "_id":
+                    if preserve_ids:
+                        try:
+                            cleaned["_id"] = ObjectId(v)
+                        except Exception:
+                            cleaned["_id"] = v
+                    continue
+                cleaned[k] = v
             clean_docs.append(cleaned)
 
         if not clean_docs:

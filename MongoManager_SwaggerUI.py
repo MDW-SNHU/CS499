@@ -525,12 +525,20 @@ class FileBackupRequest(BaseModel):
         default=False,
         description="If true, backup will be stored as gzipped JSON (.json.gz)."
     )
+    preserve_ids: bool = Field(
+        default = False,
+        description="If true, object ids will be preserved as part of each record.  This may cause issues with duplicate keys on restore."
+    )
 
 class FileRestoreRequest(BaseModel):
     filename: str = Field(..., description="Backup filename to restore from (as listed by /backup/collection/list).")
     drop_first: bool = Field(
         default=False,
         description="If true, drop and recreate the collection before restoring."
+    )
+    preserve_ids: bool = Field(
+        default=False,
+        description="Ids contained in the backup file will be created in the restored record where possible."
     )
 
 class FileDeleteRequest(BaseModel):
@@ -539,7 +547,7 @@ class FileDeleteRequest(BaseModel):
 @app.post("/backup/collection/to-file", tags=["Backup"], summary="Backup collection to file (JSON or GZIP)")
 def backup_collection_to_file(req: FileBackupRequest):
     try:
-        info = manager.backup_to_file(compress=req.compress)
+        info = manager.backup_to_file(compress=req.compress, preserve_ids=req.preserve_ids)
         return info
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -570,7 +578,7 @@ def download_backup_file(filename: str):
 @app.post("/restore/collection/from-file", tags=["Restore"], summary="Restore collection from backup file")
 def restore_collection_from_file(req: FileRestoreRequest):
     try:
-        result = manager.restore_from_file(req.filename, drop_first=req.drop_first)
+        result = manager.restore_from_file(req.filename, drop_first=req.drop_first, preserve_ids=req.preserve_ids)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
