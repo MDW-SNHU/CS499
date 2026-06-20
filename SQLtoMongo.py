@@ -1,43 +1,41 @@
-# SQLtoMongo.py
-#
+# ---
+#  SQLtoMongo.py
+# ---
 # SQLToMongoTranslator
 #
 # Executes SQL-style statements against MongoDB via MongoManager.
 # Supports:
 #   - SELECT with WHERE, ORDER BY, LIMIT, OFFSET
 #   - Nested SELECT in FROM (derived tables)
-#   - Aggregations: COUNT, SUM, AVG, MIN, MAX
+#   - COUNT/SUM/AVG/MIN/MAX, WHERE, ORDER BY, LIMIT, OFFSET.
 #   - INSERT, UPDATE, DELETE
+#   - Arithmetic operations
+#   - HELP command to outline available options
 #
 # Execution model:
 #   - Simple SELECTs run against the current active database (mongo.mm_database).
 #   - Nested SELECTs / derived tables use a temporary MongoDB database:
 #       _sql_tmp_YYYYMMDD_HHMMSS_<uuid>
-#   - Derived tables are materialized into temporary collections:
-#       tmp_select_<uuid>
+#   - Evaluates nested SELECTs from the inside out.
+#   - Uses temp DB when DB-level write privileges exist; otherwise temp collections
+#     in the active DB (if write allowed there).
+#         tmp_select_<uuid>
 #   - Original DB is preserved and restored after execution.
+#   - Command line is parsed to deal with keywords, parentheses, expressions, and syntax expectations
+#   - Parser makes use of many customized Datatypes for logical type assignments for various operations
+#   - Execution will continue even after faults, with error output available on default console device to aid in analysis
+#   - Materializes subquery results into temp collections (in temp DB or active DB).
+#   - Logging controlled by environment variable SQL2MONGO_LOGLEVEL:
+#         NONE  = no logging
+#         LIGHT = high-level logging
+#         DEBUG = deep internal logging
 #
 # Read-only behavior:
 #   - Read-only users can run simple SELECTs and aggregations.
 #   - Operations requiring writes (INSERT/UPDATE/DELETE, nested SELECTs with temp DBs)
 #     are degraded gracefully with warnings and empty results.
 
-# SQLtoMongo.py
-#
-# Bottom-up SQL-to-Mongo engine with hybrid temp DB / temp collection handling.
-# - Evaluates nested SELECTs from the inside out.
-# - Materializes subquery results into temp collections (in temp DB or active DB).
-# - Supports COUNT/SUM/AVG/MIN/MAX, WHERE, ORDER BY, LIMIT, OFFSET.
-# - Detects read-only users and degrades nested features gracefully.
-# - Uses temp DB when DB-level write privileges exist; otherwise temp collections
-#   in the active DB (if write allowed there).
-# - Includes Option C privilege detection: if privilege metadata is missing,
-#   probe DB-level write, then collection-level write, then fallback to read-only.
-# - Logging controlled by environment variable SQL2MONGO_LOGLEVEL:
-#       NONE  = no logging
-#       LIGHT = high-level logging
-#       DEBUG = deep internal logging
-
+# ---
 from ast import stmt
 import os
 import re
@@ -46,7 +44,6 @@ from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, List, Optional, Dict
-
 from bson import ObjectId
 
 
@@ -85,6 +82,9 @@ class TokenType(Enum):
     GTE = auto()
     KEYWORD = auto()
     EOF = auto()
+    PLUS = auto()
+    MINUS = auto()
+    SLASH = auto()
 
 
 @dataclass
@@ -206,6 +206,32 @@ class DropIndexStatement:
     name: str
     table: str
 
+@dataclass
+class ColumnAlias:
+    expr: Any
+    alias: str
+
+@dataclass
+class TableAlias:
+    source: Any
+    alias: str
+
+@dataclass
+class ArithExpr:
+    op: str      # '+', '-', '*', '/'
+    left: Any
+    right: Any
+
+@dataclass
+class UnaryExpr:
+    op: str      # '-', 'NOT'
+    operand: Any
+
+@dataclass
+class FuncExpr:
+    name: str
+    args: List[Any]
+
 # ============================================================
 # LEXER
 # ============================================================
@@ -246,7 +272,7 @@ class Lexer:
                     "DISTINCT", "AND", "OR", "LIKE", "IN", "ASC", "DESC",
                     "DESCRIBE", "HELP", "DROP", "TABLE", "INDEX",
                     "SHOW", "TABLES", "DATABASES", "INDEXES", "FROM",
-                    "CREATE", "UNIQUE", "ON"
+                    "CREATE", "UNIQUE", "ON", "AS"
                 ]:
                     toks.append(Token(TokenType.KEYWORD, upper, start))
                 else:
@@ -308,6 +334,18 @@ class Lexer:
                     toks.append(Token(TokenType.GTE, ">=", start))
                 else:
                     toks.append(Token(TokenType.GT, ">", start))
+                continue
+            if ch == "+":
+                self._advance()
+                toks.append(Token(TokenType.PLUS, "+", start))
+                continue
+            if ch == "-":
+                self._advance()
+                toks.append(Token(TokenType.MINUS, "-", start))
+                continue
+            if ch == "/":
+                self._advance()
+                toks.append(Token(TokenType.SLASH, "/", start))
                 continue
 
             # Unknown char
@@ -406,56 +444,47 @@ class Parser:
         return items
 
     def parse_select_item(self) -> Any:
-        tok = self._current()
+        # Parse an expression first (this handles identifiers, functions, arithmetic, parentheses, etc.)
+        expr = self.parse_add()
 
-        if tok.type == TokenType.STAR:
+        # Now check for alias
+        if self._current().type == TokenType.KEYWORD and self._current().value == "AS":
             self._advance()
-            return "*"
+            alias = self._expect(TokenType.IDENT).value
+            return ColumnAlias(expr=expr, alias=alias)
 
-        if tok.type == TokenType.IDENT:
-            ident = self._advance().value
-            if self._current().type == TokenType.LPAREN:
-                self._advance()
-                args: List[Any] = []
-                if self._current().type != TokenType.RPAREN:
-                    if self._current().type == TokenType.STAR:
-                        self._advance()
-                        args.append("*")
-                    else:
-                        args.append(self.parse_value())
+        # Implicit alias
+        if self._current().type == TokenType.IDENT:
+            alias = self._advance().value
+            return ColumnAlias(expr=expr, alias=alias)
 
-                    while self._current().type == TokenType.COMMA:
-                        self._advance()
-                        if self._current().type == TokenType.STAR:
-                            self._advance()
-                            args.append("*")
-                        else:
-                            args.append(self.parse_value())
-                self._expect(TokenType.RPAREN)
-                arg_sql_parts = []
-                for a in args:
-                    arg_sql_parts.append(self._value_to_sql(a))
-                arg_str = ",".join(arg_sql_parts)
-                return f"{ident}({arg_str})"
-            return ident
+        return expr
 
+        # Handle subquery in SELECT list
         if tok.type == TokenType.LPAREN:
             self._advance()
             sub = self.parse_select()
             self._expect(TokenType.RPAREN)
-            return sub
+            return self._maybe_parse_column_alias(sub)
 
         raise Exception(f"Invalid SELECT item starting at {tok.value}")
-
+    
     def parse_from_source(self) -> Any:
         tok = self._current()
+
+        # Subquery source
         if tok.type == TokenType.LPAREN:
             self._advance()
             sub_select = self.parse_select()
             self._expect(TokenType.RPAREN)
-            return SubqueryRef(select=sub_select)
+            source = SubqueryRef(select=sub_select)
+            return self._maybe_parse_table_alias(source)
+
+        # Table reference
         if tok.type == TokenType.IDENT:
-            return TableRef(name=self._advance().value)
+            table = TableRef(name=self._advance().value)
+            return self._maybe_parse_table_alias(table)
+
         raise Exception(f"Invalid FROM source: {tok.value}")
 
     def parse_order_by(self) -> List[tuple]:
@@ -521,7 +550,7 @@ class Parser:
             op_tok = self._current()
             if op_tok.type in (TokenType.EQ, TokenType.LT, TokenType.LTE, TokenType.GT, TokenType.GTE):
                 op = self._advance().value
-                val = self.parse_value()
+                val = self.parse_add()
                 return CompareExpr(field=field, op=op, value=val)
         if tok.type == TokenType.LPAREN:
             self._advance()
@@ -539,6 +568,84 @@ class Parser:
         if tok.type == TokenType.IDENT:
             return self._advance().value
         raise Exception(f"Unsupported value token: {tok.value}")
+    
+    def parse_add(self) -> Any:
+        node = self.parse_mul()
+
+        while self._current().type in (TokenType.PLUS, TokenType.MINUS):
+            op = self._advance().value
+            right = self.parse_mul()
+            node = ArithExpr(op=op, left=node, right=right)
+
+        return node
+    
+    def parse_mul(self) -> Any:
+        node = self.parse_unary()
+
+        while self._current().type in (TokenType.STAR, TokenType.SLASH):
+            op = self._advance().value
+            right = self.parse_unary()
+            node = ArithExpr(op=op, left=node, right=right)
+
+        return node
+    
+    def parse_unary(self) -> Any:
+        tok = self._current()
+
+        # Unary NOT
+        if tok.type == TokenType.KEYWORD and tok.value == "NOT":
+            self._advance()
+            operand = self.parse_unary()
+            return UnaryExpr(op="NOT", operand=operand)
+
+        # Unary minus
+        if tok.type == TokenType.MINUS:
+            self._advance()
+            operand = self.parse_unary()
+            return UnaryExpr(op="-", operand=operand)
+
+        return self.parse_primary()
+    
+    def parse_primary(self) -> Any:
+        tok = self._current()
+
+        # Parenthesized expression
+        if tok.type == TokenType.LPAREN:
+            self._advance()
+            expr = self.parse_add()
+            self._expect(TokenType.RPAREN)
+            return expr
+
+        # String literal
+        if tok.type == TokenType.STRING:
+            return self._advance().value
+
+        # Number literal
+        if tok.type == TokenType.NUMBER:
+            return int(self._advance().value)
+
+        # Identifier or function call
+        if tok.type == TokenType.IDENT:
+            ident = self._advance().value
+
+            # Function call?
+            if self._current().type == TokenType.LPAREN:
+                self._advance()
+                args = []
+
+                if self._current().type != TokenType.RPAREN:
+                    args.append(self.parse_add())
+                    while self._current().type == TokenType.COMMA:
+                        self._advance()
+                        args.append(self.parse_add())
+
+                self._expect(TokenType.RPAREN)
+                return FuncExpr(name=ident, args=args)
+
+            # Field reference
+            return ident
+
+        raise Exception(f"Unexpected token in expression: {tok.value}")
 
     # ------------------------------------------------------------
     # INSERT
@@ -592,7 +699,7 @@ class Parser:
     def parse_set_item(self) -> UpdateSetItem:
         col = self._expect(TokenType.IDENT).value
         self._expect(TokenType.EQ)
-        val = self.parse_value()
+        val = self.parse_add()
         return UpdateSetItem(column=col, value=val)
 
     # ------------------------------------------------------------
@@ -757,6 +864,34 @@ class Parser:
             raise Exception(f"Expected {t}, got {tok.type}")
         return self._advance()
 
+    def _maybe_parse_column_alias(self, expr: Any) -> Any:
+        # Explicit AS alias
+        if self._current().type == TokenType.KEYWORD and self._current().value == "AS":
+            self._advance()
+            alias = self._expect(TokenType.IDENT).value
+            return ColumnAlias(expr=expr, alias=alias)
+
+        # Implicit alias: expr alias
+        if self._current().type == TokenType.IDENT:
+            alias = self._advance().value
+            return ColumnAlias(expr=expr, alias=alias)
+
+        return expr
+    
+    def _maybe_parse_table_alias(self, source: Any) -> Any:
+        # Explicit AS alias
+        if self._current().type == TokenType.KEYWORD and self._current().value == "AS":
+            self._advance()
+            alias = self._expect(TokenType.IDENT).value
+            return TableAlias(source=source, alias=alias)
+
+        # Implicit alias
+        if self._current().type == TokenType.IDENT:
+            alias = self._advance().value
+            return TableAlias(source=source, alias=alias)
+
+        return source
+    
 # ============================================================
 # SQL ENGINE
 # ============================================================
@@ -974,7 +1109,19 @@ class SQLToMongoTranslator:
         if offset is not None:
             plan.append(f"OFFSET: {offset}")
 
-        # 5. Execute Mongo query
+        # 5. Detect expressions in SELECT list
+        needs_pipeline = False
+        for f in stmt.fields:
+            if isinstance(f, ColumnAlias):
+                if not isinstance(f.expr, str):
+                    needs_pipeline = True
+                    break
+#        _log_debug(f"needs_pipeline = {needs_pipeline}")
+#        print(needs_pipeline)
+        if needs_pipeline:
+            return self._eval_select_pipeline(stmt, plan)
+
+        # 6. Execute Mongo query
         cursor = base_coll.find(mongo_filter)
 
         if sort_spec:
@@ -1125,103 +1272,40 @@ class SQLToMongoTranslator:
     # ------------------------------------------------------------
     # PROJECTION & AGGREGATES
     # ------------------------------------------------------------
-    def _apply_projection(self, fields: List[Any], docs: List[Dict[str, Any]], plan: List[str]):
-        # Aggregates
-        if len(fields) == 1 and isinstance(fields[0], str):
-            f = fields[0]
-            has_paren = False
-            index = 0
-            while index < len(f):
-                if f[index] == "(":
-                    has_paren = True
-                    break
-                index += 1
-            ends_with_paren = False
-            if len(f) > 0 and f[len(f) - 1] == ")":
-                ends_with_paren = True
-            if has_paren and ends_with_paren:
-                func, arg = f.split("(", 1)
-                func = func.upper()
-                arg = arg[:-1]
+    def _apply_projection(self, fields, docs, plan):
+        projected = []
 
-                if func == "COUNT":
-                    plan.append("APPLY AGGREGATE: COUNT")
-                    if arg == "*":
-                        return [{"COUNT": len(docs)}]
-                    count_value = 0
-                    for d in docs:
-                        if arg in d:
-                            count_value += 1
-                    return [{"COUNT": count_value}]
-
-                if func == "SUM":
-                    plan.append("APPLY AGGREGATE: SUM")
-                    total_sum = 0
-                    for d in docs:
-                        total_sum += d.get(arg, 0)
-                    return [{"SUM": total_sum}]
-
-                if func == "AVG":
-                    plan.append("APPLY AGGREGATE: AVG")
-                    vals = []
-                    for d in docs:
-                        vals.append(d.get(arg, 0))
-                    if vals:
-                        total = 0
-                        for v in vals:
-                            total += v
-                        avg_value = total / len(vals)
-                    else:
-                        avg_value = 0
-                    return [{"AVG": avg_value}]
-
-                if func == "MIN":
-                    plan.append("APPLY AGGREGATE: MIN")
-                    vals = []
-                    for d in docs:
-                        if arg in d:
-                            vals.append(d.get(arg))
-                    if vals:
-                        current_min = vals[0]
-                        idx = 1
-                        while idx < len(vals):
-                            if vals[idx] < current_min:
-                                current_min = vals[idx]
-                            idx += 1
-                        min_value = current_min
-                    else:
-                        min_value = None
-                    return [{"MIN": min_value}]
-
-                if func == "MAX":
-                    plan.append("APPLY AGGREGATE: MAX")
-                    vals = []
-                    for d in docs:
-                        if arg in d:
-                            vals.append(d.get(arg))
-                    if vals:
-                        current_max = vals[0]
-                        idx = 1
-                        while idx < len(vals):
-                            if vals[idx] > current_max:
-                                current_max = vals[idx]
-                            idx += 1
-                        max_value = current_max
-                    else:
-                        max_value = None
-                    return [{"MAX": max_value}]
-
-        # Normal projection
-        out = []
         for d in docs:
             row = {}
+
             for f in fields:
+                # Wildcard
                 if f == "*":
-                    row.update(d)
-                else:
+                    for k, v in d.items():
+                        row[k] = v
+                    continue
+
+                # ColumnAlias: use alias as key
+                if isinstance(f, ColumnAlias):
+                    alias = f.alias
+                    expr = f.expr
+
+                    # For now, support simple field names as expr
+                    if isinstance(expr, str):
+                        row[alias] = d.get(expr)
+                    else:
+                        # Placeholder for expression evaluation
+                        row[alias] = None
+                    continue
+
+                # Plain field name
+                if isinstance(f, str):
                     row[f] = d.get(f)
-            out.append(row)
-        return out
+                    continue
+
+            projected.append(row)
+
+        return projected
 
     # ------------------------------------------------------------
     # SQL RECONSTRUCTION (for debugging)
@@ -1531,6 +1615,81 @@ class SQLToMongoTranslator:
                 except Exception:
                     return(value)
         return value
+
+    def _eval_select_pipeline(self, stmt, plan):
+        pipeline = []
+
+        # WHERE
+        if stmt.where:
+            mongo_filter = self._compile_where(stmt.where, plan)
+            pipeline.append({"$match": mongo_filter})
+
+        # PROJECT
+        proj = {}
+
+        for f in stmt.fields:
+            if isinstance(f, ColumnAlias):
+                proj[f.alias] = self._compile_expr(f.expr)
+            elif isinstance(f, str):
+                proj[f] = f"${f}"
+            elif f == "*":
+                # Expand later if needed
+                pass
+
+        # Always remove _id to avoid ObjectId serialization errors
+        proj["_id"] = 0
+
+        pipeline.append({"$project": proj})
+        _log_debug(f"project stage: {proj}")
+        print(f"project stage: {proj}")
+
+        # ORDER BY
+        if stmt.order_by:
+            sort = {field: direction for field, direction in stmt.order_by}
+            pipeline.append({"$sort": sort})
+
+        # LIMIT
+        if stmt.limit:
+            pipeline.append({"$limit": stmt.limit})
+
+        docs = self.mongo.mm_collection.aggregate(pipeline)
+        return list(docs)
+    
+    def _compile_expr(self, expr):
+        # Numeric literal
+        if isinstance(expr, (int, float)):
+            return expr
+
+        # Field or literal string
+        if isinstance(expr, str):
+            if expr.isidentifier():
+                return f"${expr}"
+            return expr
+
+        # Arithmetic expression
+        if isinstance(expr, ArithExpr):
+            left = self._compile_expr(expr.left)
+            right = self._compile_expr(expr.right)
+
+            if expr.op == "+":
+                return {"$add": [left, right]}
+            if expr.op == "-":
+                return {"$subtract": [left, right]}
+            if expr.op == "*":
+                return {"$multiply": [left, right]}
+            if expr.op == "/":
+                return {"$divide": [left, right]}
+
+        # Unary expression
+        if isinstance(expr, UnaryExpr):
+            operand = self._compile_expr(expr.operand)
+            if expr.op == "-":
+                return {"$multiply": [-1, operand]}
+            if expr.op == "NOT":
+                return {"$not": [operand]}
+
+        return None
+
 # ============================================================
 # END OF SQLToMongoTranslator
 # ============================================================

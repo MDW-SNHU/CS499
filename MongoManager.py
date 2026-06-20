@@ -19,16 +19,27 @@
 # to manage authentication and connection is available within the library.
 # ---
 # Version History:
+# +++
 #     v0.1 - May 24, 2026 - Incorporated and updated AAC_CRUD_Operations.py written for CS340 adding more comprehensive set
 #                               of methods that are geared towards full database utility rather than only CRUD operations.
+# +++
+#     v1.0 - June 20, 2026 - Nearing final updates prior to finishing out the Captsone project for SNHU course CS-499.
+#                               Added enhancements to facilitate presenting the class as API routines on a Swagger endpoint, then
+#                               continued to add updates as new work was incorporated that presents a SQL to Mongo translation
+#                               feature.  Existing operations were maintained, with the base CRUD routines and the added 
+#                               management features providing a stable back-end for the Swagger API interface.
 # ---
 # Mark Woodford
 # SNHU CS499 Computer Science Capstone
 # May 24, 2026
 # ---
 
+# ---
+# Python modules necessary for functionality.  The class needs to be able to operate separately from the python artifact
+#     module that's using it.
+# ---
 from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError
+from pymongo.errors import OperationFailure, ServerSelectionTimeoutError
 from bson.objectid import ObjectId
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +69,53 @@ class MongoManager(object):
     # ---
     # Authentication
     # ---
+    def authenticate(self, username=None, password=None, host="127.0.0.1", port=27017, database=None, timeout=3000):
+
+        try:
+            # Always authenticate against admin
+            self.mm_client = MongoClient(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                authSource="admin",
+                authMechanism="SCRAM-SHA-256",
+                serverSelectionTimeoutMS=timeout
+            )
+
+            # Force authentication immediately
+            self.mm_client.admin.command("ping")
+
+            # Working DB (user-selected or default)
+            dbname = database or "admin"
+            self.mm_database = self.mm_client[dbname]
+
+            # Mark authenticated
+            self.authenticated = True
+            self.current_user = username
+            self.current_db = dbname
+
+            return True
+
+        except OperationFailure as e:
+            msg = str(e).lower()
+
+            # Wrong username/password
+            if "authentication failed" in msg or "auth failed" in msg:
+                return False
+
+            # User is authenticated but lacks privileges
+            if "not authorized" in msg:
+                raise Exception("Not authorized for this operation")
+
+            raise
+
+        except ServerSelectionTimeoutError:
+            raise Exception("Timed out trying to reach server")
+
+        except Exception as e:
+            raise Exception(f"Authentication failed: {str(e)}")
+    """
     def authenticate(self, username=None, password=None, host="127.0.0.1", port=27017, database=None, timeout=3000):
         # Function establishes a connection to a MongoDB instance and selects a database.
         #     Not all parameters are necessary, depending on what functions are being performed.
@@ -89,7 +147,7 @@ class MongoManager(object):
             raise Exception("Authentication failed: Timed out trying to reach server.")
         except Exception as e:
             raise Exception(f"Authentication failed: {str(e)}")
-
+        """
     # ---
     # This method is used to detect whether the authenticated account has only read access or whether
     #    it can create temporary databases for nested searches and more complex operations.  It was 

@@ -16,57 +16,133 @@
 #    https://www.mongodb.com/products/self-managed/community-edition so that a local database instance can be installed and started.
 # ---
 # Version History:
+# +++
 #    v0.1 - May 24, 2026 - After additional methods were added to the AAC_CRUD_Operations.py in that served as the base
 #        for a management class for MongoDB, this file was created to provide a user accessible interface for testing and
 #        using the methods in that resulting python module and class, MongoManager.
+# +++
+#    v1.0 - June 20, 2026 - Nearing final updates prior to finishing out the Captsone project for SNHU course CS-499
+#        with endpoints and functions added to cover many management functions for Mongo including authentication, CRUD
+#        operations on Mongo documents, collection management, database management, index management, backup and restore 
+#        operations, aggregations, and a SQL Helper option to allow a substantial number of SQL features to be translated
+#        to the functional equivalents in Mongo.  
 # ---
 # Mark Woodford
 # SNHU CS499 Computer Science Capstone
 # May 24, 2026
 # ---
 
+# ---
+# Import external python modules to take advantage of existing interfaces to do some of the heavy
+#    lifting so as not to reinvent the wheel when public-domain options are available.
+# ---
 from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form, APIRouter
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, Dict, List, Optional
 from functools import lru_cache
 from pathlib import Path
+from pymongo.errors import PyMongoError
 import uvicorn
 import json
 import os
 
+# ---
+# Import custom classes that implement enhanced Mongo operations and SQL to Mongo translations features
+# ---
 from MongoManager import MongoManager
 from SQLtoMongo import SQLToMongoTranslator
 
+# ---
 # Get the path from which the script is being executed in case we need locally stored files nearby...  
+# ---
 home_dir = os.path.dirname(os.path.abspath(__file__))
 
+# ---
+# FastAPI to manage WebUI operations and provide Swagger functionality
+# ---
 app = FastAPI(
     title="Mongo Manager API",
     description="Full-featured Swagger UI for MongoManager operations",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None
 )
 
+# ---
+# APIRouter will provide the gateway to the SQL Helper features
+# ---
 router = APIRouter()
 
-# Ensure that the MongoManager is single-threaded.  We don't want to have to manage logins
-# multiple times or deal with threads that can't figure out that they're not currently
-# authenticated.  Threading is find when dealing with certain operations, but the a functions 
-# called from the manager is not one of them.
-@lru_cache()
-def get_manager():
-    return MongoManager()
-manager = get_manager()
+# ---
+# The features implemented are designed to be single-threaded on the Swagger UI so we need to
+#    ensure that the MongoManager is single-threaded.  We don't want to have to manage logins
+#    multiple times or deal with threads that can't figure out that they're not currently
+#    authenticated.  Threading is fine when dealing with certain operations, but the applied 
+#    functions called from the manager UI is not one of them.
+# ---
+@lru_cache()                # Provide caching of function operations, allowing data retention of prior function uses 
 
-translator = SQLToMongoTranslator(manager)
+def get_manager():          # simple function to return a new MongoManager instance
+    return MongoManager()   
+manager = get_manager()     # create a manager for our Swagger UI use
+
+translator = SQLToMongoTranslator(manager)  # This will allow passing the manager instance to the SQL helper class
+
+# ---
+# Exception handlers
+# ---
+# These handlers should catch most errors without impeding application loading and performance.  It won't handle everything,
+#     but should handle most errors common to the features used in this application
+# ---
+@app.exception_handler(PyMongoError)
+async def pymongo_exception_handler(request, exc: PyMongoError):
+    msg = str(exc)
+    status = 403 if "not authorized" in msg.lower() else 500
+    return JSONResponse(
+        status_code=status,
+        content={"detail": msg}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()}
+    )
+
+@app.middleware("http")
+async def catch_all_exceptions(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(exc)}
+        )
+    
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)}
+    )
 
 # ---
 # About Endpoint
 # ---
-# Provide a test function to display information about the current version
+# Provide a simple function to demonstrate Swagger interface features including a "Try it Out" option which
+#     will display information about the current version.
 # ---
-
 @app.get("/", tags=["About"], summary="About this API")
 def about():
     return {
@@ -81,14 +157,14 @@ def about():
 # Authentication Models
 # ---
 # Below is the mechanism to ensure that Swagger UI is authenticated.  Provides a standard function for authentication
-#    as well as there being a form to display to fill in login information.  This section defines the structure for the 
+#    as well as there being a form to display to fill in login information.  This section defines the data structure for the 
 #    authentication information as well as providing the interface to make the authentication call which should be 
 #    valid for the duration of the Swagger session.  The call to the authenticate function from the API is executed in this
 #    section here as well.
 # ---
 class Credentials(BaseModel):
-    username: Optional[str] = Field(None)
-    password: Optional[str] = Field(None)
+    username: Optional[str] = Form(None)
+    password: Optional[str] = Form(None, format="password")
     host: str = Field(default="127.0.0.1")
     port: int = Field(default=27017)
     database: Optional[str] = Field(None)
@@ -110,10 +186,236 @@ class Credentials(BaseModel):
     )
 
 # ---
-# Authentication Logic
+# Authentication Logic and web interface endpoint
 # ---
-# Try to authenticate and return the result.
+# Try to authenticate using a dataclass specific to the function and return the result.
 # ---
+def mongo_requires_auth():
+    try:
+        # Try to authenticate with empty credentials
+        test = MongoManager()
+        ok = test.authenticate(
+            username=None,
+            password=None,
+            host="127.0.0.1",
+            port=27017,
+            database="admin"
+        )
+        # If authenticate() returns True, no-auth mode
+        return not ok
+    except:
+        # Any failure means secure mode
+        return True
+
+@app.get("/docs", include_in_schema=False)
+def custom_docs():
+    # Always assume secure mode for your environment
+    secure_mode = True
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MongoManager API</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css" />
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }}
+        .tabs {{
+            display: flex;
+            background: #2c3e50;
+            padding: 10px;
+        }}
+        .tab {{
+            color: white;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-right: 1px solid #1a252f;
+        }}
+        .tab.active {{
+            background: #34495e;
+            font-weight: bold;
+        }}
+        #login-panel, #api-panel {{
+            padding: 20px;
+        }}
+        .login-box {{
+            max-width: 400px;
+            margin: 40px auto;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            background: #fafafa;
+        }}
+        .login-box input {{
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 12px;
+            border-radius: 4px;
+            border: 1px solid #bbb;
+        }}
+        .login-box button {{
+            width: 100%;
+            padding: 10px;
+            background: #2c3e50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }}
+        .login-box button:hover {{
+            background: #1a252f;
+        }}
+    </style>
+</head>
+
+<body>
+
+    <div class="tabs">
+        <div id="tab-login" class="tab active">Login</div>
+        <div id="tab-api" class="tab" style="display:{'none' if secure_mode else 'block'};">API</div>
+    </div>
+
+    <div id="login-panel" style="display:{'block' if secure_mode else 'none'};">
+        <div class="login-box">
+            <h3>MongoDB Authentication</h3>
+            <input id="username" type="text" placeholder="Username (optional)">
+            <input id="password" type="password" placeholder="Password (optional)">
+            <input id="host" type="text" value="127.0.0.1" placeholder="Host">
+            <input id="port" type="number" value="27017" placeholder="Port">
+            <input id="database" type="text" placeholder="Database (optional)">
+            <button onclick="submitAuth()">Authenticate</button>
+        </div>
+    </div>
+
+    <div id="api-panel" style="display:{'none' if secure_mode else 'block'};">
+        <div id="swagger-ui"></div>
+    </div>
+
+    <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+
+    <script>
+        let swaggerLoaded = false;
+
+        function showError(message) {{
+            alert("Error: " + message);
+        }}
+
+        function loadSwagger() {{
+            if (swaggerLoaded) return;
+            swaggerLoaded = true;
+
+            SwaggerUIBundle({{
+                url: "/openapi.json",
+                dom_id: "#swagger-ui",
+                layout: "BaseLayout",
+
+                responseInterceptor: (res) => {{
+                    // Handle HTTP errors
+                    if (res.status >= 400) {{
+                        let msg = "Unknown error";
+
+                        if (res.data && res.data.detail) {{
+                            msg = res.data.detail;
+                        }} else if (res.statusText) {{
+                            msg = res.statusText;
+                        }}
+
+                        // Authentication failure
+                        if (res.status === 401) {{
+                            switchToLogin(msg);
+                            return res;
+                        }}
+
+                        // Authorization failure
+                        if (res.status === 403) {{
+                            showError("Not authorized: " + msg);
+                            return res;
+                        }}
+
+                        // Other errors
+                        showError(msg);
+                        return res;
+                    }}
+
+                    // Handle FastAPI error payloads inside 200 responses
+                    if (res.data && res.data.error) {{
+                        showError(res.data.error);
+                    }}
+
+                    return res;
+                }}
+            }});
+        }}
+
+        function switchToLogin(message) {{
+            alert(message || "Authentication required");
+            document.getElementById("login-panel").style.display = "block";
+            document.getElementById("api-panel").style.display = "none";
+            document.getElementById("tab-login").classList.add("active");
+            document.getElementById("tab-api").classList.remove("active");
+            document.getElementById("password").value = "";
+        }}
+
+        document.getElementById("tab-login").onclick = () => {{
+            document.getElementById("login-panel").style.display = "block";
+            document.getElementById("api-panel").style.display = "none";
+            document.getElementById("tab-login").classList.add("active");
+            document.getElementById("tab-api").classList.remove("active");
+        }};
+
+        document.getElementById("tab-api").onclick = () => {{
+            document.getElementById("login-panel").style.display = "none";
+            document.getElementById("api-panel").style.display = "block";
+            document.getElementById("tab-api").classList.add("active");
+            document.getElementById("tab-login").classList.remove("active");
+            loadSwagger();
+        }};
+
+        function submitAuth() {{
+            fetch("/authenticate", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{
+                    username: document.getElementById("username").value,
+                    password: document.getElementById("password").value,
+                    host: document.getElementById("host").value,
+                    port: parseInt(document.getElementById("port").value),
+                    database: document.getElementById("database").value
+                }})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.status === "authenticated") {{
+                    const user = document.getElementById("username").value || "user";
+                    const db = document.getElementById("database").value || "db";
+
+                    document.getElementById("tab-api").innerText = "API (" + user + "@" + db + ")";
+                    document.getElementById("tab-api").style.display = "block";
+                    document.getElementById("tab-api").click();
+                    loadSwagger();
+                }} else {{
+                    showError("Authentication failed");
+                }}
+            }})
+            .catch(err => {{
+                showError("Unexpected error: " + err);
+            }});
+        }}
+    </script>
+
+</body>
+</html>
+"""
+
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+    )
+    
 def require_auth(credentials: Credentials):
     try:
         manager.authenticate(
@@ -140,48 +442,17 @@ def authenticate(credentials: Credentials):
         "secure": secured
     }
 
+# ---
+# Endpoint and functional interface to determine whether read-only features are active or not
+# ---
 @app.post("/readonly", tags=["Authentication"], summary="Check to see if authenticated account is in read-only mode")
 def check_readonly():
     return {"readonly": manager.is_read_only()}
 
 # ---
-# Authentication Form Page
-# ---
-#@app.get("/auth/form", tags=["Authentication"], response_class=HTMLResponse)
-def auth_form():
-    # If functions detect that authentication hasn't been obtained, they should direct here to allow
-    #    for authentication so functions don't fail on authentication.  This is not yet implemented
-    #    as the method of forcing FastAPI to use a separate window is under investigation.
-    return """
-    <html>
-    <head><title>MongoDB Authentication</title></head>
-    <body>
-        <h2>MongoDB Authentication</h2>
-        <form action="/authenticate" method="post">
-            <label>Username:</label><br>
-            <input type="text" name="username"><br>
-            <label>Password:</label><br>
-            <input type="password" name="password"><br>
-            <label>Host:</label><br>
-            <input type="text" name="host" value="127.0.0.1"><br>
-            <label>Port:</label><br>
-            <input type="number" name="port" value="27017"><br>
-            <label>Database:</label><br>
-            <input type="text" name="database"><br><br>
-            <label>Timeout (ms):</label><br>
-            <input type="number" name="timeout" value="3000"><br>
-            <button type="submit">Authenticate</button>
-        </form>
-    </body>
-    </html>
-    """
-
-# ---
 # Database Models
 # ---
-# These are the endpoints for database list/create/drop/use.  Each section simply
-#    executes the associated function and reports results.  A class with the database
-#    request format is included at the start of the section.
+# These are the custom data classes for use with the database endpoints.  
 # ---
 class DatabaseRequest(BaseModel):
     #Pydantic model definition for a database request
@@ -194,7 +465,7 @@ class DatabaseRequest(BaseModel):
 # ---
 # Database Endpoints
 # ---
-# These endpoints and accompanying functions will allow database list,create,drop, and use operations
+# These endpoints and accompanying functions will allow database list, create, drop, and use operations
 # ---
 @app.get("/database/list", tags=["Database"], summary="List all defined databases")
 def list_databases():
@@ -217,10 +488,8 @@ def use_database(req: DatabaseRequest):
 # Collection Models
 # ---
 # In the same fashion of the database methods above, this is the section that provides
-#    endpoints for collections along with a configuration format for collection requests at the
-#    start of the section.
+#    data classes and sample values along with the endpoints for managing collections.
 # ---
-# Pydantic models for collection requests, with a separate model for renames.
 class CollectionRequest(BaseModel):
     collection_name: str = Field(...)
     schema_specs: Optional[Dict[str, Any]] = None
@@ -240,7 +509,7 @@ class RenameRequest(BaseModel):
 # ---
 # Collection Endpoints
 # ---
-# Colletion list,create,drop, and select endpoints.
+# Colletion list, create, drop, and select endpoints.
 # ===
 @app.get("/collection/list", tags=["Collection"], summary="List collections")
 def list_collections():
@@ -267,7 +536,7 @@ def set_collection(req: CollectionRequest):
 # ---
 # These are the functions whieh were the inspiration for the class and user interface.  They
 #    provide a set of definitions for database request structure detail along with the functions to 
-#    execute create/read/update/delete from the connected database.  An additional function has been
+#    execute create/read/update/delete from the connected database.  Additional functions have been
 #    incorporated to allow adding multiple records in bulk as well.
 # ---
 # First, the pydantic models for dealing with documents.  Create accepts a json Dict, CreateMany is a list json Dicts, and 
@@ -343,7 +612,7 @@ class DocumentUpdate(BaseModel):
         }
     }
 # ---
-# CRUD Endpoints
+# Now the CRUD Endpoints.
 # ---
 # These routines will perform create (in its various forms, read, update, and delete operations.  With the 
 #    read (find), update (put), and delete (drop) requests they just call the corresponding method from the
@@ -387,7 +656,7 @@ def create_from_file(json_file: UploadFile = File(...)):
         records_inserted = manager.create_many(json_data)
         return {"inserted": records_inserted}
     except json.JSONDecodeError:
-        pass  # Fall through to Newline Delimited JSON parsing
+        pass  # Fall through to newline delimited JSON parsing
 
     # Newline Delimited JSON fallback
     new_docs = []
@@ -443,6 +712,9 @@ class IndexRequest(BaseModel):
 class IndexDrop(BaseModel):
     index_name: str
 
+# ---
+# Endpoints to allow index list, create, and drop operations.
+# ---
 @app.get("/index/list", tags=["Indexes"], summary="List indexes")
 def list_indexes():
     return manager.list_indexes()
@@ -502,7 +774,13 @@ def run_aggregation(req: AggregationRequest):
     return manager.aggregate(req.pipeline)
 
 # ---
-# Backup / Restore (existing in-memory endpoints)
+# Backups and restores initially allowed only in-app use... that is, the data was returned to the UI and displayed and though
+#    it could be copied and pasted to an external file there was no way given to do that automatically.  The problem with that
+#    is the overhead incurred was slowing down the behind-the-scenes operations, so file-base backups and restores were
+#    added.  Both file-based and UI based options are currently presented, and will operated against the current collection
+#    (selectable using the "Collections -> Set" endpoint).
+# ---
+# Data classes and functions for Backup / Restore (existing in-memory endpoints)
 # ---
 class RestoreRequest(BaseModel):
     documents: List[Dict[str, Any]]
@@ -517,7 +795,7 @@ def restore_collection(req: RestoreRequest):
     return manager.restore_collection(req.documents, req.drop_first)
 
 # ---
-# Backup / Restore (File-based, JSON + GZIP)
+# Data classes and functions for Backup / Restore (File-based, JSON + GZIP)
 # ---
 
 class FileBackupRequest(BaseModel):
@@ -594,8 +872,8 @@ def delete_backup_file(req: FileDeleteRequest):
 # ---
 # The below section implements the SQL translation piece of the UI.  The return from this
 #    translation is rather flexible.  The idea is to include both the given SQL query string and the resulting Mongo
-#    translation, then append to that the results of the executed query.  The actual translation mechanics are implemented in
-#    the included SQLtoMongo class.
+#    translation, or at least a representation of what the Mongo logic applied will be.  The result is then appended to 
+#    the results of the executed query.  The actual translation mechanics are implemented in the included SQLtoMongo class.
 # ---
 
 class SQLExecutionResponse(BaseModel):
