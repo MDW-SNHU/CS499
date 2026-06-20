@@ -407,15 +407,13 @@ class MongoManager(object):
         cursor = self.mm_collection.find({})
         for doc in cursor:
             cleaned = {}
-            for doc in cursor:
-                cleaned = {}
-                for k, v in doc.items():
-                    if k == "_id":
-                        if preserve_ids:
-                            cleaned["_id"] = str(v)
-                        continue
-                    cleaned[k] = self._convert_ids_deep(v)
-                docs.append(cleaned)
+            for k, v in doc.items():
+                if k == "_id":
+                    if preserve_ids:
+                        cleaned["_id"] = str(v)
+                    continue
+                cleaned[k] = self._convert_ids_deep(v)
+            docs.append(cleaned)
 
         count = len(docs)
         timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -466,8 +464,6 @@ class MongoManager(object):
         Validates database/collection metadata and inserts documents.
         """
         self._verify_collection()
-        meta_preserve = meta.get("preserve_ids", False)
-        preserve_ids = preserve_ids or meta_preserve
 
         backup_path = self.backup_dir / filename
         if not backup_path.exists():
@@ -499,6 +495,11 @@ class MongoManager(object):
                 f"Backup collection '{coll_name}' does not match active collection '{self.mm_collection.name}'."
             )
 
+        # If backup was created with preserve_ids=True, default to preserving
+        meta_preserve = meta.get("preserve_ids", False)
+        preserve_ids = preserve_ids or meta_preserve
+
+        # Drop the existing collection if requested
         if drop_first:
             self.mm_collection.drop()
             self.mm_database.create_collection(self.mm_collection.name)
@@ -518,6 +519,7 @@ class MongoManager(object):
                 cleaned[k] = v
             clean_docs.append(cleaned)
 
+        # Insert the docs that we've collected
         if not clean_docs:
             return {"restored": 0}
 

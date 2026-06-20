@@ -194,6 +194,18 @@ class ShowDatabasesStmt:
 class ShowIndexesStmt:
     table: str
 
+@dataclass
+class CreateIndexStatement:
+    name: str
+    table: str
+    fields: list   # list of (field_name, direction)
+    unique: bool
+
+@dataclass
+class DropIndexStatement:
+    name: str
+    table: str
+
 # ============================================================
 # LEXER
 # ============================================================
@@ -232,8 +244,9 @@ class Lexer:
                     "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "OFFSET",
                     "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
                     "DISTINCT", "AND", "OR", "LIKE", "IN", "ASC", "DESC",
-                    "DESCRIBE", "HELP", "DROP", "TABLE",
-                    "SHOW", "TABLES", "DATABASES", "INDEXES", "FROM"
+                    "DESCRIBE", "HELP", "DROP", "TABLE", "INDEX",
+                    "SHOW", "TABLES", "DATABASES", "INDEXES", "FROM",
+                    "CREATE", "UNIQUE", "ON"
                 ]:
                     toks.append(Token(TokenType.KEYWORD, upper, start))
                 else:
@@ -312,28 +325,8 @@ class Parser:
         self.tokens = tokens
         self.index = 0
 
-    def current(self) -> Token:
-        return self.tokens[self.index]
-
-    def advance(self) -> Token:
-        tok = self.current()
-        self.index += 1
-        return tok
-
-    def expect_kw(self, kw: str) -> Token:
-        tok = self.current()
-        if tok.type != TokenType.KEYWORD or tok.value != kw:
-            raise Exception(f"Expected keyword {kw}, got {tok.value}")
-        return self.advance()
-
-    def expect(self, t: TokenType) -> Token:
-        tok = self.current()
-        if tok.type != t:
-            raise Exception(f"Expected {t}, got {tok.type}")
-        return self.advance()
-
     def parse_statement(self) -> Any:
-        tok = self.current()
+        tok = self._current()
         if tok.type == TokenType.KEYWORD:
             if tok.value == "SELECT":
                 return self.parse_select()
@@ -343,8 +336,10 @@ class Parser:
                 return self.parse_update()
             if tok.value == "DELETE":
                 return self.parse_delete()
+            if tok.value == "CREATE":
+                return self.parse_create_index()
             if tok.value == "DROP":
-               return self.parse_drop_table()
+                return self.parse_drop()
             if tok.value == "SHOW":
                 return self.parse_show()
             if tok.value == "DESCRIBE":
@@ -357,15 +352,15 @@ class Parser:
     # SELECT
     # ------------------------------------------------------------
     def parse_select(self) -> SelectStmt:
-        self.expect_kw("SELECT")
+        self._expect_kw("SELECT")
         distinct = False
-        if self.current().type == TokenType.KEYWORD and self.current().value == "DISTINCT":
+        if self._current().type == TokenType.KEYWORD and self._current().value == "DISTINCT":
             distinct = True
-            self.advance()
+            self._advance()
 
         fields = self.parse_select_list()
 
-        self.expect_kw("FROM")
+        self._expect_kw("FROM")
         from_source = self.parse_from_source()
 
         where = None
@@ -373,23 +368,23 @@ class Parser:
         limit = None
         offset = None
 
-        while self.current().type == TokenType.KEYWORD:
-            kw = self.current().value
+        while self._current().type == TokenType.KEYWORD:
+            kw = self._current().value
             if kw == "WHERE":
-                self.advance()
+                self._advance()
                 where = self.parse_expr()
             elif kw == "ORDER":
-                self.advance()
-                self.expect_kw("BY")
+                self._advance()
+                self._expect_kw("BY")
                 order_by = self.parse_order_by()
             elif kw == "LIMIT":
-                self.advance()
-                if self.current().type == TokenType.NUMBER:
-                    limit = int(self.advance().value)
+                self._advance()
+                if self._current().type == TokenType.NUMBER:
+                    limit = int(self._advance().value)
             elif kw == "OFFSET":
-                self.advance()
-                if self.current().type == TokenType.NUMBER:
-                    offset = int(self.advance().value)
+                self._advance()
+                if self._current().type == TokenType.NUMBER:
+                    offset = int(self._advance().value)
             else:
                 break
 
@@ -405,38 +400,38 @@ class Parser:
 
     def parse_select_list(self) -> List[Any]:
         items = [self.parse_select_item()]
-        while self.current().type == TokenType.COMMA:
-            self.advance()
+        while self._current().type == TokenType.COMMA:
+            self._advance()
             items.append(self.parse_select_item())
         return items
 
     def parse_select_item(self) -> Any:
-        tok = self.current()
+        tok = self._current()
 
         if tok.type == TokenType.STAR:
-            self.advance()
+            self._advance()
             return "*"
 
         if tok.type == TokenType.IDENT:
-            ident = self.advance().value
-            if self.current().type == TokenType.LPAREN:
-                self.advance()
+            ident = self._advance().value
+            if self._current().type == TokenType.LPAREN:
+                self._advance()
                 args: List[Any] = []
-                if self.current().type != TokenType.RPAREN:
-                    if self.current().type == TokenType.STAR:
-                        self.advance()
+                if self._current().type != TokenType.RPAREN:
+                    if self._current().type == TokenType.STAR:
+                        self._advance()
                         args.append("*")
                     else:
                         args.append(self.parse_value())
 
-                    while self.current().type == TokenType.COMMA:
-                        self.advance()
-                        if self.current().type == TokenType.STAR:
-                            self.advance()
+                    while self._current().type == TokenType.COMMA:
+                        self._advance()
+                        if self._current().type == TokenType.STAR:
+                            self._advance()
                             args.append("*")
                         else:
                             args.append(self.parse_value())
-                self.expect(TokenType.RPAREN)
+                self._expect(TokenType.RPAREN)
                 arg_sql_parts = []
                 for a in args:
                     arg_sql_parts.append(self._value_to_sql(a))
@@ -445,41 +440,41 @@ class Parser:
             return ident
 
         if tok.type == TokenType.LPAREN:
-            self.advance()
+            self._advance()
             sub = self.parse_select()
-            self.expect(TokenType.RPAREN)
+            self._expect(TokenType.RPAREN)
             return sub
 
         raise Exception(f"Invalid SELECT item starting at {tok.value}")
 
     def parse_from_source(self) -> Any:
-        tok = self.current()
+        tok = self._current()
         if tok.type == TokenType.LPAREN:
-            self.advance()
+            self._advance()
             sub_select = self.parse_select()
-            self.expect(TokenType.RPAREN)
+            self._expect(TokenType.RPAREN)
             return SubqueryRef(select=sub_select)
         if tok.type == TokenType.IDENT:
-            return TableRef(name=self.advance().value)
+            return TableRef(name=self._advance().value)
         raise Exception(f"Invalid FROM source: {tok.value}")
 
     def parse_order_by(self) -> List[tuple]:
         items: List[tuple] = []
-        field = self.expect(TokenType.IDENT).value
+        field = self._expect(TokenType.IDENT).value
         direction = 1
-        if self.current().type == TokenType.KEYWORD and self.current().value in ("ASC", "DESC"):
-            if self.current().value == "DESC":
+        if self._current().type == TokenType.KEYWORD and self._current().value in ("ASC", "DESC"):
+            if self._current().value == "DESC":
                 direction = -1
-            self.advance()
+            self._advance()
         items.append((field, direction))
-        while self.current().type == TokenType.COMMA:
-            self.advance()
-            field = self.expect(TokenType.IDENT).value
+        while self._current().type == TokenType.COMMA:
+            self._advance()
+            field = self._expect(TokenType.IDENT).value
             direction = 1
-            if self.current().type == TokenType.KEYWORD and self.current().value in ("ASC", "DESC"):
-                if self.current().value == "DESC":
+            if self._current().type == TokenType.KEYWORD and self._current().value in ("ASC", "DESC"):
+                if self._current().value == "DESC":
                     direction = -1
-                self.advance()
+                self._advance()
             items.append((field, direction))
         return items
 
@@ -491,91 +486,86 @@ class Parser:
 
     def parse_or(self) -> Any:
         left = self.parse_and()
-        while self.current().type == TokenType.KEYWORD and self.current().value == "OR":
-            op = self.advance().value
+        while self._current().type == TokenType.KEYWORD and self._current().value == "OR":
+            op = self._advance().value
             right = self.parse_and()
             left = BinaryExpr(op=op, left=left, right=right)
         return left
 
     def parse_and(self) -> Any:
         left = self.parse_primary_cond()
-        while self.current().type == TokenType.KEYWORD and self.current().value == "AND":
-            op = self.advance().value
+        while self._current().type == TokenType.KEYWORD and self._current().value == "AND":
+            op = self._advance().value
             right = self.parse_primary_cond()
             left = BinaryExpr(op=op, left=left, right=right)
         return left
 
     def parse_primary_cond(self) -> Any:
-        tok = self.current()
+        tok = self._current()
         if tok.type == TokenType.IDENT:
-            field = self.advance().value
-            if self.current().type == TokenType.KEYWORD and self.current().value == "LIKE":
-                self.advance()
-                val_tok = self.current()
+            field = self._advance().value
+            if self._current().type == TokenType.KEYWORD and self._current().value == "LIKE":
+                self._advance()
+                val_tok = self._current()
                 if val_tok.type == TokenType.STRING:
-                    pattern = self.advance().value
+                    pattern = self._advance().value
                 else:
                     raise Exception("LIKE requires string literal")
                 return LikeExpr(field=field, pattern=pattern)
-            if self.current().type == TokenType.KEYWORD and self.current().value == "IN":
-                self.advance()
-                self.expect(TokenType.LPAREN)
+            if self._current().type == TokenType.KEYWORD and self._current().value == "IN":
+                self._advance()
+                self._expect(TokenType.LPAREN)
                 sub_select = self.parse_select()
-                self.expect(TokenType.RPAREN)
+                self._expect(TokenType.RPAREN)
                 return InSubqueryExpr(field=field, subquery=sub_select)
-            op_tok = self.current()
+            op_tok = self._current()
             if op_tok.type in (TokenType.EQ, TokenType.LT, TokenType.LTE, TokenType.GT, TokenType.GTE):
-                op = self.advance().value
+                op = self._advance().value
                 val = self.parse_value()
                 return CompareExpr(field=field, op=op, value=val)
         if tok.type == TokenType.LPAREN:
-            self.advance()
+            self._advance()
             inner = self.parse_expr()
-            self.expect(TokenType.RPAREN)
+            self._expect(TokenType.RPAREN)
             return inner
         raise Exception(f"Unsupported condition starting at {tok.value}")
 
     def parse_value(self) -> Any:
-        tok = self.current()
+        tok = self._current()
         if tok.type == TokenType.STRING:
-            return self.advance().value
+            return self._advance().value
         if tok.type == TokenType.NUMBER:
-            return int(self.advance().value)
+            return int(self._advance().value)
         if tok.type == TokenType.IDENT:
-            return self.advance().value
+            return self._advance().value
         raise Exception(f"Unsupported value token: {tok.value}")
-
-    def _value_to_sql(self, value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        return str(value)
 
     # ------------------------------------------------------------
     # INSERT
     # ------------------------------------------------------------
     def parse_insert(self) -> InsertStmt:
-        self.expect_kw("INSERT")
-        self.expect_kw("INTO")
-        table = self.expect(TokenType.IDENT).value
+        self._expect_kw("INSERT")
+        self._expect_kw("INTO")
+        table = self._expect(TokenType.IDENT).value
 
         columns: Optional[List[str]] = None
-        if self.current().type == TokenType.LPAREN:
-            self.advance()
+        if self._current().type == TokenType.LPAREN:
+            self._advance()
             columns = []
-            columns.append(self.expect(TokenType.IDENT).value)
-            while self.current().type == TokenType.COMMA:
-                self.advance()
-                columns.append(self.expect(TokenType.IDENT).value)
-            self.expect(TokenType.RPAREN)
+            columns.append(self._expect(TokenType.IDENT).value)
+            while self._current().type == TokenType.COMMA:
+                self._advance()
+                columns.append(self._expect(TokenType.IDENT).value)
+            self._expect(TokenType.RPAREN)
 
-        self.expect_kw("VALUES")
-        self.expect(TokenType.LPAREN)
+        self._expect_kw("VALUES")
+        self._expect(TokenType.LPAREN)
         values: List[Any] = []
         values.append(self.parse_value())
-        while self.current().type == TokenType.COMMA:
-            self.advance()
+        while self._current().type == TokenType.COMMA:
+            self._advance()
             values.append(self.parse_value())
-        self.expect(TokenType.RPAREN)
+        self._expect(TokenType.RPAREN)
 
         return InsertStmt(table=table, columns=columns, values=values)
 
@@ -583,25 +573,25 @@ class Parser:
     # UPDATE
     # ------------------------------------------------------------
     def parse_update(self) -> UpdateStmt:
-        self.expect_kw("UPDATE")
-        table = self.expect(TokenType.IDENT).value
-        self.expect_kw("SET")
+        self._expect_kw("UPDATE")
+        table = self._expect(TokenType.IDENT).value
+        self._expect_kw("SET")
         set_items: List[UpdateSetItem] = []
         set_items.append(self.parse_set_item())
-        while self.current().type == TokenType.COMMA:
-            self.advance()
+        while self._current().type == TokenType.COMMA:
+            self._advance()
             set_items.append(self.parse_set_item())
 
         where = None
-        if self.current().type == TokenType.KEYWORD and self.current().value == "WHERE":
-            self.advance()
+        if self._current().type == TokenType.KEYWORD and self._current().value == "WHERE":
+            self._advance()
             where = self.parse_expr()
 
         return UpdateStmt(table=table, set_items=set_items, where=where)
 
     def parse_set_item(self) -> UpdateSetItem:
-        col = self.expect(TokenType.IDENT).value
-        self.expect(TokenType.EQ)
+        col = self._expect(TokenType.IDENT).value
+        self._expect(TokenType.EQ)
         val = self.parse_value()
         return UpdateSetItem(column=col, value=val)
 
@@ -609,45 +599,101 @@ class Parser:
     # DELETE
     # ------------------------------------------------------------
     def parse_delete(self) -> DeleteStmt:
-        self.expect_kw("DELETE")
-        self.expect_kw("FROM")
-        table = self.expect(TokenType.IDENT).value
+        self._expect_kw("DELETE")
+        self._expect_kw("FROM")
+        table = self._expect(TokenType.IDENT).value
         where = None
-        if self.current().type == TokenType.KEYWORD and self.current().value == "WHERE":
-            self.advance()
+        if self._current().type == TokenType.KEYWORD and self._current().value == "WHERE":
+            self._advance()
             where = self.parse_expr()
         return DeleteStmt(table=table, where=where)
     
     # ------------------------------------------------------------
-    # DROP TABLE
+    # CREATE
     # ------------------------------------------------------------
-    def parse_drop_table(self) -> DropTableStmt:
-        self.expect_kw("DROP")
-        self.expect_kw("TABLE")
-        table = self.expect(TokenType.IDENT).value
-        return DropTableStmt(table=table)
+    def parse_create_index(self):
+        self._expect_kw("CREATE")
+
+        unique = False
+        if self._current().value == "UNIQUE":
+            unique = True
+            self._advance()
+
+        self._expect_kw("INDEX")
+        name = self._expect(TokenType.IDENT).value
+
+        self._expect_kw("ON")
+        table = self._expect(TokenType.IDENT).value
+
+        self._expect(TokenType.LPAREN)
+
+        fields = []
+        while True:
+            field = self._expect(TokenType.IDENT).value
+
+            direction = "asc"
+            if self._current().type == TokenType.KEYWORD and self._current().value in ("ASC", "DESC"):
+                direction = self._advance().value.lower()
+
+            fields.append((field, direction))
+
+            if self._current().type == TokenType.COMMA:
+                self._advance()
+                continue
+            break
+
+        self._expect(TokenType.RPAREN)
+
+        return CreateIndexStatement(name=name, table=table, fields=fields, unique=unique)
+    
+    # ------------------------------------------------------------
+    # DROP (INDEX or TABLE)
+    # ------------------------------------------------------------
+    def parse_drop(self):
+        self._expect_kw("DROP")
+        print(self._current())
+        if self._peek_next_keyword("TABLE"):
+            self._expect_kw("TABLE")
+            table = self._expect(TokenType.IDENT).value
+            return DropTableStmt(table=table)
+
+        if self._peek_next_keyword("INDEX"):
+            self._expect_kw("INDEX")
+            name = self._expect(TokenType.IDENT).value
+            self._expect_kw("ON")
+            table = self._expect(TokenType.IDENT).value
+            return DropIndexStatement(name=name, table=table)
+        
+        if self._peek_next_keyword("DATABASE"):
+            return "Function not yet implemented, DROP DATABASE"
+        if self._peek_next_keyword("USER"):
+            return "Function not yet implemented, DROP USER"
+        if self._peek_next_keyword("VIEW"):
+            return "Function not yet implemented, DROP VIEW"
+
+        raise Exception("Unsupported DROP command")
     
     # ------------------------------------------------------------
     # SHOW
     # ------------------------------------------------------------ 
     def parse_show(self):
-        self.expect_kw("SHOW")
+        self._expect_kw("SHOW")
 
         # SHOW TABLES
-        if self.current().type == TokenType.KEYWORD and self.current().value == "TABLES":
-            self.advance()
+        if self._current().type == TokenType.KEYWORD and self._current().value == "TABLES":
+            self._advance()
             return ShowTablesStmt()
 
         # SHOW DATABASES
-        if self.current().type == TokenType.KEYWORD and self.current().value == "DATABASES":
-            self.advance()
+        if self._current().type == TokenType.KEYWORD and self._current().value == "DATABASES":
+            self._advance()
             return ShowDatabasesStmt()
 
         # SHOW INDEXES FROM <table>
-        if self.current().type == TokenType.KEYWORD and self.current().value == "INDEXES":
-            self.advance()
-            self.expect_kw("FROM")
-            table = self.expect(TokenType.IDENT).value
+        if self._current().type == TokenType.KEYWORD and self._current().value == "INDEXES":
+            self._advance()
+            self._expect_kw("FROM")
+            table = self._expect(TokenType.IDENT).value
             return ShowIndexesStmt(table=table)
 
         return "Unsupported SHOW command."
@@ -656,19 +702,61 @@ class Parser:
     # DESCRIBE
     # ------------------------------------------------------------
     def parse_describe(self) -> str:
-        self.expect_kw("DESCRIBE")
-        table = self.expect(TokenType.IDENT).value
+        self._expect_kw("DESCRIBE")
+        table = self._expect(TokenType.IDENT).value
         return DescribeStmt(table=table)
     
     # ------------------------------------------------------------
     # HELP
     # ------------------------------------------------------------
     def parse_help(self) -> HelpStmt:
-        self.expect_kw("HELP")
+        self._expect_kw("HELP")
         topic = None
-        if (self.current().type == TokenType.KEYWORD and self.current().value not in ("EOF")):
-            topic = self.advance().value
+        if (self._current().type == TokenType.KEYWORD and self._current().value not in ("EOF")):
+            topic = self._advance().value
         return HelpStmt(topic=topic)
+
+    # ============================================================
+    # HELPER FUNCTIONS
+    # ============================================================
+    def _peek_keyword(self, value: str) -> bool:
+            tok = self._current()
+            return tok.type == TokenType.KEYWORD and tok.value.upper() == value.upper()    
+    
+    def _peek(self):
+        if self.index + 1 < len(self.tokens):
+            return self.tokens[self.index + 1]
+        return Token(TokenType.EOF, "", None)
+    
+    def _peek_next_keyword(self, value: str) -> bool:
+        tok = self._peek()  # look ahead one token
+        return tok.value
+
+    def _value_to_sql(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    def _current(self) -> Token:
+        return self.tokens[self.index]
+
+    def _advance(self) -> Token:
+        tok = self._current()
+        self.index += 1
+        return tok
+
+    def _expect_kw(self, kw: str) -> Token:
+        tok = self._current()
+        if tok.type != TokenType.KEYWORD or tok.value != kw:
+            raise Exception(f"Expected keyword {kw}, got {tok.value}")
+        return self._advance()
+
+    def _expect(self, t: TokenType) -> Token:
+        tok = self._current()
+        if tok.type != t:
+            raise Exception(f"Expected {t}, got {tok.type}")
+        return self._advance()
+
 # ============================================================
 # SQL ENGINE
 # ============================================================
@@ -693,7 +781,7 @@ class SQLToMongoTranslator:
         self._temp_db_name: Optional[str] = None
 
         self._detect_privileges()
-
+    
     # ------------------------------------------------------------
     # OPTION C PRIVILEGE DETECTION
     # ------------------------------------------------------------
@@ -803,8 +891,12 @@ class SQLToMongoTranslator:
             return self._execute_update(stmt)
         if isinstance(stmt, DeleteStmt):
             return self._execute_delete(stmt)
+        if isinstance(stmt, CreateIndexStatement):
+            return self._execute_create_index(stmt)
         if isinstance(stmt, DropTableStmt):
             return self._execute_drop_table(stmt)
+        if isinstance(stmt, DropIndexStatement):
+            return self._execute_drop_index(stmt)
         if isinstance(stmt, ShowTablesStmt):
             return self._execute_show_tables()
         if isinstance(stmt, ShowDatabasesStmt):
@@ -1297,6 +1389,29 @@ class SQLToMongoTranslator:
                 "result": f"Error: {str(e)}"
             }
 
+    def _execute_create_index(self, stmt: CreateIndexStatement):
+        # select collection
+        self.mongo.set_collection(stmt.table)
+
+        # build request dict in the format MongoManager expects
+        req = {
+            "fields": [
+                {"name": field, "direction": direction}
+                for field, direction in stmt.fields
+            ],
+            "unique": stmt.unique,
+            "name": stmt.name,
+        }
+
+        result = self.mongo.create_index(req)
+        return {
+            "sql": f"CREATE INDEX {stmt.name} ON {stmt.table}("
+                    + ", ".join(f"{f} {d.upper()}" for f, d in stmt.fields)
+                    + ")",
+            "mongo_plan": "CREATE a Mongo index using create_index() with the parameters: " + str(req),
+            "result": "Created index " + req['name'] + ".",
+        }
+
     def _execute_describe(self, stmt: DescribeStmt) -> Dict[str, Any]:
         if stmt.table not in self.mongo.mm_database.list_collection_names():
             return(f"Table '{stmt.table}' does not exist.")
@@ -1309,13 +1424,15 @@ class SQLToMongoTranslator:
             return {"sql": f"DESCRIBE {stmt.table}", "mongo_plan": "find_one()", "result": {"fields": fields}}
         
     def _execute_help(self, stmt: HelpStmt) -> Dict[str, Any]:
-        general_help = "Supported SQL commands: SELECT, INSERT, UPDATE, DELETE, DESCRIBE, SHOW, DROP, HELP. Use HELP <COMMAND> for details."
+        general_help = "Supported SQL commands: SELECT, CREATE, INSERT, UPDATE, DELETE, DESCRIBE, SHOW, DROP, HELP. Use HELP <COMMAND> for details."
         if stmt.topic is None:
             return {"sql": "HELP", "mongo_plan": "N/A", "result": general_help}
         
         topic = stmt.topic.upper()
         if topic == "SELECT":
             detail = "SELECT syntax: SELECT [DISTINCT] fields FROM source [WHERE condition] [ORDER BY fields] [LIMIT n] [OFFSET n]"
+        elif topic == "CREATE":
+            detail = "CREATE syntax: CREATE [UNIQUE] INDEX idx ON table(field)"
         elif topic == "INSERT":
             detail = "INSERT syntax: INSERT INTO table [(columns)] VALUES (values)"
         elif topic == "UPDATE":
@@ -1333,14 +1450,32 @@ class SQLToMongoTranslator:
         elif topic == "INDEXES":
             detail = "SHOW INDEXES syntax: SHOW INDEXES FROM table"
         elif topic == "DROP":
-            detail = "DROP syntax: DROP TABLE table"
+            detail = "DROP syntax: DROP TABLE | DROP INDEX"
+        elif topic == "TABLE":
+            detail = "DROP TABLE syntax: DROP TABLE tablename"
+        elif topic == "INDEX":
+            detail = "DROP INDEX syntax: DROP INDEX idx_name ON table"
         elif topic == "HELP":
             detail = "HELP syntax: HELP [TOPIC]. If TOPIC is provided, shows details for that command. Otherwise, shows general help."
         else:
             detail = f"No help available for topic '{stmt.topic}'. {general_help}"
         
         return {"sql": f"HELP {stmt.topic}", "mongo_plan": "N/A", "result": detail}
-    
+
+    def _execute_drop_index(self, stmt: DropIndexStatement):
+        self.mongo.mm_database.set_collection(stmt.table)
+        try:
+            result = self.mongo.drop_index(stmt.name)
+            ret_string = "Dropped index " + stmt.name
+        except Exception as e:
+            ret_status = "Error trying to drop index: " + e
+        return {
+                "sql": f"DROP INDEX {stmt.name}",
+                "mongo_plan": "Execute drop_index() on index" + stmt.name,
+                "result": ret_string,
+        }
+         
+
     def _execute_drop_table(self, stmt: DropTableStmt) -> Dict[str, Any]:
         table = stmt.table
 
@@ -1375,7 +1510,7 @@ class SQLToMongoTranslator:
                 "mongo_plan": "DROP TABLE",
                 "result": f"Error dropping table: {str(e)}"
             }
-
+    
     def _convert_object_ids(self, docs):
         cleaned = []
         for d in docs:
@@ -1396,7 +1531,6 @@ class SQLToMongoTranslator:
                 except Exception:
                     return(value)
         return value
-
 # ============================================================
 # END OF SQLToMongoTranslator
 # ============================================================
