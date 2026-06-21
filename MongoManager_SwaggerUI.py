@@ -21,7 +21,7 @@
 #        for a management class for MongoDB, this file was created to provide a user accessible interface for testing and
 #        using the methods in that resulting python module and class, MongoManager.
 # +++
-#    v1.0 - June 20, 2026 - Nearing final updates prior to finishing out the Captsone project for SNHU course CS-499
+#    v1.0 - June 20, 2026 - Nearing final updates prior to finishing out the Capstone project for SNHU course CS-499
 #        with endpoints and functions added to cover many management functions for Mongo including authentication, CRUD
 #        operations on Mongo documents, collection management, database management, index management, backup and restore 
 #        operations, aggregations, and a SQL Helper option to allow a substantial number of SQL features to be translated
@@ -29,7 +29,7 @@
 # ---
 # Mark Woodford
 # SNHU CS499 Computer Science Capstone
-# May 24, 2026
+# June 20, 2026
 # ---
 
 # ---
@@ -97,6 +97,7 @@ translator = SQLToMongoTranslator(manager)  # This will allow passing the manage
 # These handlers should catch most errors without impeding application loading and performance.  It won't handle everything,
 #     but should handle most errors common to the features used in this application
 # ---
+"""
 @app.exception_handler(PyMongoError)
 async def pymongo_exception_handler(request, exc: PyMongoError):
     msg = str(exc)
@@ -136,7 +137,7 @@ async def global_exception_handler(request, exc: Exception):
         status_code=500,
         content={"detail": str(exc)}
     )
-
+"""
 # ---
 # About Endpoint
 # ---
@@ -878,20 +879,29 @@ def delete_backup_file(req: FileDeleteRequest):
 
 class SQLExecutionResponse(BaseModel):
     sql: str
-    translation: str
+    translation: dict
     result: Any
 
 @router.post("/sql/execute", tags=["SQL Helper"], response_model=SQLExecutionResponse)
 def execute_sql_query(sql_query: str):
-    # New translator already EXECUTES the SQL and returns:
+    # Translator returns:
     #   { "sql": ..., "mongo_plan": ..., "result": ... }
     translation = translator.translate_sql(sql_query)
 
-    sql_string = translation["sql"]
-    mongo_plan = translation["mongo_plan"]
-    result = translation["result"]
+    sql_string = translation.get("sql")
+    mongo_plan = translation.get("mongo_plan")
+    result = translation.get("result")
 
-    # For backward compatibility with your UI, we map:
+    # --- Normalize mongo_plan so it is ALWAYS a dict ---
+    # If translator returned a string, wrap it.
+    # If translator returned None, replace with empty dict.
+    if isinstance(mongo_plan, str):
+        mongo_plan = {"info": mongo_plan}
+    elif mongo_plan is None:
+        mongo_plan = {}
+    # If it's already a dict, leave it alone.
+
+    # For backward compatibility with your UI:
     #   translation -> mongo_plan
     #   result      -> result
     #   sql         -> sql

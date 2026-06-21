@@ -23,7 +23,7 @@
 #     v0.1 - May 24, 2026 - Incorporated and updated AAC_CRUD_Operations.py written for CS340 adding more comprehensive set
 #                               of methods that are geared towards full database utility rather than only CRUD operations.
 # +++
-#     v1.0 - June 20, 2026 - Nearing final updates prior to finishing out the Captsone project for SNHU course CS-499.
+#     v1.0 - June 20, 2026 - Nearing final updates prior to finishing out the Capstone project for SNHU course CS-499.
 #                               Added enhancements to facilitate presenting the class as API routines on a Swagger endpoint, then
 #                               continued to add updates as new work was incorporated that presents a SQL to Mongo translation
 #                               feature.  Existing operations were maintained, with the base CRUD routines and the added 
@@ -31,7 +31,7 @@
 # ---
 # Mark Woodford
 # SNHU CS499 Computer Science Capstone
-# May 24, 2026
+# June 20, 2026
 # ---
 
 # ---

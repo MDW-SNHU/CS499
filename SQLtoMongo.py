@@ -34,8 +34,25 @@
 #   - Read-only users can run simple SELECTs and aggregations.
 #   - Operations requiring writes (INSERT/UPDATE/DELETE, nested SELECTs with temp DBs)
 #     are degraded gracefully with warnings and empty results.
-
 # ---
+# # Version History:
+# +++
+#     v0.1 - May 31, 2026 - This is a wholly new submission that was made to satisfy CS499's Algorithms and Data Structures milestone.
+#                               It translates basic (and even some advanced) SQL to Mongo functions, and executes the commands to provide
+#                               a method for SQL-savvy users to perform Mongo related operations without having to stumble around on the
+#                               Swagger UI.  Code submitted has a lot of features missing, and is still very much a work in progress.
+# +++
+#     v1.0 - June 21, 2026 - Nearing final updates prior to finishing out the Capstone project for SNHU course CS-499.
+#                               Added deal with common SQL functions, deal with arithmetic expressions in command lines, deal
+#                               with aliases using AS.  Last enhancement worked on provides JOIN functionality, though this is 
+#                               still in need of testing and adjusting (this one was a major ordeal to implement).  The product,
+#                               like many existing commercial products, may have issues but can be addressed as they are discovered.
+# ---
+# Mark Woodford
+# SNHU CS499 Computer Science Capstone
+# June 21, 2026
+# ---
+
 from ast import stmt
 import os
 import re
@@ -113,6 +130,16 @@ class SelectStmt:
 class TableRef:
     name: str
 
+@dataclass
+class ColumnRef:
+    def __init__(self, table=None, name=None):
+        self.table = table
+        self.name = name
+
+    def __repr__(self):
+        if self.table:
+            return f"{self.table}.{self.name}"
+        return self.name
 
 @dataclass
 class SubqueryRef:
@@ -232,6 +259,13 @@ class FuncExpr:
     name: str
     args: List[Any]
 
+@dataclass
+class JoinRef:
+    left: Any
+    right: Any
+    on: Any
+    join_type: str  # "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS"
+
 # ============================================================
 # LEXER
 # ============================================================
@@ -263,8 +297,12 @@ class Lexer:
             # Identifiers / keywords
             if ch.isalpha() or ch == "_":
                 ident = ""
-                while self._peek().isalnum() or self._peek() in ("_", "."):
+                # consume the first character
+                ident += self._advance()
+                # then consume the rest
+                while self._peek().isalnum() or self._peek() == "_":
                     ident += self._advance()
+
                 upper = ident.upper()
                 if upper in [
                     "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "OFFSET",
@@ -272,7 +310,8 @@ class Lexer:
                     "DISTINCT", "AND", "OR", "LIKE", "IN", "ASC", "DESC",
                     "DESCRIBE", "HELP", "DROP", "TABLE", "INDEX",
                     "SHOW", "TABLES", "DATABASES", "INDEXES", "FROM",
-                    "CREATE", "UNIQUE", "ON", "AS"
+                    "CREATE", "UNIQUE", "ON", "AS", "JOIN", "ON",
+                    "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER"
                 ]:
                     toks.append(Token(TokenType.KEYWORD, upper, start))
                 else:
@@ -299,6 +338,10 @@ class Lexer:
                 continue
 
             # Single-character tokens
+            if ch == ".":
+                self._advance()
+                toks.append(Token(TokenType.DOT, ".", start))
+                continue
             if ch == ",":
                 self._advance()
                 toks.append(Token(TokenType.COMMA, ",", start))
@@ -384,6 +427,7 @@ class Parser:
                 return self.parse_describe()
             if tok.value == "HELP":
                 return self.parse_help()
+
         raise Exception(f"Unsupported SQL command: {tok.value}")
 
     # ------------------------------------------------------------
@@ -444,32 +488,92 @@ class Parser:
         return items
 
     def parse_select_item(self) -> Any:
-        # Parse an expression first (this handles identifiers, functions, arithmetic, parentheses, etc.)
+        tok = self._current()
+
+        # 1. Handle "*"
+        if tok.type == TokenType.STAR:
+            self._advance()
+            return "*"
+
+        # 2. Handle subquery in SELECT list:  (SELECT ...)
+        if tok.type == TokenType.LPAREN:
+            self._advance()
+            expr = self.parse_add()
+            self._expect(TokenType.RPAREN)
+            return self._maybe_parse_column_alias(expr)
+
+        # 3. Handle full SQL expressions (identifiers, arithmetic, functions, parentheses, etc.)
         expr = self.parse_add()
 
-        # Now check for alias
-        if self._current().type == TokenType.KEYWORD and self._current().value == "AS":
+        # 4. Explicit alias: AS alias
+        if self._current().type == TokenType.KEYWORD and self._current().value.upper() == "AS":
             self._advance()
             alias = self._expect(TokenType.IDENT).value
             return ColumnAlias(expr=expr, alias=alias)
 
-        # Implicit alias
+        # 5. Implicit alias: expr alias
         if self._current().type == TokenType.IDENT:
             alias = self._advance().value
             return ColumnAlias(expr=expr, alias=alias)
 
+        # 6. No alias
         return expr
-
-        # Handle subquery in SELECT list
-        if tok.type == TokenType.LPAREN:
-            self._advance()
-            sub = self.parse_select()
-            self._expect(TokenType.RPAREN)
-            return self._maybe_parse_column_alias(sub)
-
-        raise Exception(f"Invalid SELECT item starting at {tok.value}")
     
     def parse_from_source(self) -> Any:
+        # Parse the initial table or subquery
+        source = self._parse_single_from_source()
+
+        # Parse zero or more JOINs
+        while self._current().type == TokenType.KEYWORD and self._current().value in ("JOIN", "INNER", "LEFT", "RIGHT"):
+            join_type = "INNER"
+
+            kw = self._current().value
+            if kw == "JOIN":
+                self._advance()
+            elif kw == "INNER":
+                self._advance()
+                self._expect_kw("JOIN")
+                join_type = "INNER"
+            elif kw == "LEFT":
+                self._advance()
+                if self._current().type == TokenType.KEYWORD and self._current().value == "OUTER":
+                    self._advance()
+                self._expect_kw("JOIN")
+                join_type = "LEFT"
+            elif kw == "RIGHT":
+                self._advance()
+                if self._current().type == TokenType.KEYWORD and self._current().value == "OUTER":
+                    self._advance()
+                self._expect_kw("JOIN")
+                join_type = "RIGHT"
+
+            # Right side table/subquery
+            right = self._parse_single_from_source()
+
+            # ON clause
+            self._expect_kw("ON")
+            on_expr = self.parse_expr()
+
+            # RIGHT JOIN → rewrite as LEFT JOIN
+            if join_type == "RIGHT":
+                source = JoinRef(
+                    left=right,
+                    right=source,
+                    on=self._flip_join_condition(on_expr),
+                    join_type="LEFT"
+                )
+            else:
+                source = JoinRef(
+                    left=source,
+                    right=right,
+                    on=on_expr,
+                    join_type=join_type
+                )
+
+        return source
+
+
+    def _parse_single_from_source(self) -> Any:
         tok = self._current()
 
         # Subquery source
@@ -531,32 +635,41 @@ class Parser:
 
     def parse_primary_cond(self) -> Any:
         tok = self._current()
-        if tok.type == TokenType.IDENT:
-            field = self._advance().value
-            if self._current().type == TokenType.KEYWORD and self._current().value == "LIKE":
-                self._advance()
-                val_tok = self._current()
-                if val_tok.type == TokenType.STRING:
-                    pattern = self._advance().value
-                else:
-                    raise Exception("LIKE requires string literal")
-                return LikeExpr(field=field, pattern=pattern)
-            if self._current().type == TokenType.KEYWORD and self._current().value == "IN":
-                self._advance()
-                self._expect(TokenType.LPAREN)
-                sub_select = self.parse_select()
-                self._expect(TokenType.RPAREN)
-                return InSubqueryExpr(field=field, subquery=sub_select)
-            op_tok = self._current()
-            if op_tok.type in (TokenType.EQ, TokenType.LT, TokenType.LTE, TokenType.GT, TokenType.GTE):
-                op = self._advance().value
-                val = self.parse_add()
-                return CompareExpr(field=field, op=op, value=val)
+
+        # Parenthesized condition
         if tok.type == TokenType.LPAREN:
             self._advance()
             inner = self.parse_expr()
             self._expect(TokenType.RPAREN)
             return inner
+
+        # LIKE and IN still require an identifier on the left
+        if tok.type == TokenType.IDENT:
+            # Look ahead: is this LIKE or IN?
+            if self._peek().type == TokenType.KEYWORD and self._peek().value == "LIKE":
+                field = self._advance().value
+                self._advance()  # LIKE
+                pattern = self._expect(TokenType.STRING).value
+                return LikeExpr(field=field, pattern=pattern)
+
+            if self._peek().type == TokenType.KEYWORD and self._peek().value == "IN":
+                field = self._advance().value
+                self._advance()  # IN
+                self._expect(TokenType.LPAREN)
+                sub = self.parse_select()
+                self._expect(TokenType.RPAREN)
+                return InSubqueryExpr(field=field, subquery=sub)
+
+        # Otherwise: parse a full expression on the left
+        left = self.parse_add()
+
+        # Comparison operator
+        tok = self._current()
+        if tok.type in (TokenType.EQ, TokenType.LT, TokenType.LTE, TokenType.GT, TokenType.GTE):
+            op = self._advance().value
+            right = self.parse_add()
+            return CompareExpr(field=left, op=op, value=right)
+
         raise Exception(f"Unsupported condition starting at {tok.value}")
 
     def parse_value(self) -> Any:
@@ -642,8 +755,14 @@ class Parser:
                 self._expect(TokenType.RPAREN)
                 return FuncExpr(name=ident, args=args)
 
-            # Field reference
-            return ident
+            # Dotted identifier: table.column
+            if self._current().type == TokenType.DOT:
+                self._advance()  # consume '.'
+                field = self._expect(TokenType.IDENT).value
+                return ColumnRef(table=ident, name=field)
+
+            # Simple identifier
+            return ColumnRef(name=ident)
 
         raise Exception(f"Unexpected token in expression: {tok.value}")
 
@@ -758,7 +877,6 @@ class Parser:
     # ------------------------------------------------------------
     def parse_drop(self):
         self._expect_kw("DROP")
-        print(self._current())
         if self._peek_next_keyword("TABLE"):
             self._expect_kw("TABLE")
             table = self._expect(TokenType.IDENT).value
@@ -817,12 +935,15 @@ class Parser:
     # HELP
     # ------------------------------------------------------------
     def parse_help(self) -> HelpStmt:
+        # Consume the HELP keyword
         self._expect_kw("HELP")
-        topic = None
-        if (self._current().type == TokenType.KEYWORD and self._current().value not in ("EOF")):
-            topic = self._advance().value
-        return HelpStmt(topic=topic)
 
+        # Optional topic: HELP SELECT, HELP INSERT, etc.
+        topic = None
+        if self._current().type in (TokenType.IDENT, TokenType.KEYWORD) and self._current().type != TokenType.EOF:
+            topic = self._advance().value
+
+        return HelpStmt(topic=topic)
     # ============================================================
     # HELPER FUNCTIONS
     # ============================================================
@@ -854,7 +975,7 @@ class Parser:
 
     def _expect_kw(self, kw: str) -> Token:
         tok = self._current()
-        if tok.type != TokenType.KEYWORD or tok.value != kw:
+        if tok.type != TokenType.KEYWORD or tok.value.upper() != kw:
             raise Exception(f"Expected keyword {kw}, got {tok.value}")
         return self._advance()
 
@@ -878,18 +999,14 @@ class Parser:
 
         return expr
     
-    def _maybe_parse_table_alias(self, source: Any) -> Any:
-        # Explicit AS alias
-        if self._current().type == TokenType.KEYWORD and self._current().value == "AS":
-            self._advance()
-            alias = self._expect(TokenType.IDENT).value
-            return TableAlias(source=source, alias=alias)
-
-        # Implicit alias
-        if self._current().type == TokenType.IDENT:
+    def _maybe_parse_table_alias(self, source):
+        if self._current().type == TokenType.IDENT and \
+        self._current().value.upper() not in (
+            "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS",
+            "WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING"
+        ):
             alias = self._advance().value
             return TableAlias(source=source, alias=alias)
-
         return source
     
 # ============================================================
@@ -1018,32 +1135,37 @@ class SQLToMongoTranslator:
         parser = Parser(tokens)
         stmt = parser.parse_statement()
 
-        if isinstance(stmt, SelectStmt):
-            return self._execute_select(stmt)
-        if isinstance(stmt, InsertStmt):
-            return self._execute_insert(stmt)
-        if isinstance(stmt, UpdateStmt):
-            return self._execute_update(stmt)
-        if isinstance(stmt, DeleteStmt):
-            return self._execute_delete(stmt)
-        if isinstance(stmt, CreateIndexStatement):
-            return self._execute_create_index(stmt)
-        if isinstance(stmt, DropTableStmt):
-            return self._execute_drop_table(stmt)
-        if isinstance(stmt, DropIndexStatement):
-            return self._execute_drop_index(stmt)
-        if isinstance(stmt, ShowTablesStmt):
-            return self._execute_show_tables()
-        if isinstance(stmt, ShowDatabasesStmt):
-            return self._execute_show_databases()
-        if isinstance(stmt, ShowIndexesStmt):
-            return self._execute_show_indexes(stmt)
-        if isinstance(stmt, DescribeStmt):
-            return self._execute_describe(stmt)
-        if isinstance(stmt, HelpStmt):
-            return self._execute_help(stmt)
+        try:
+            if isinstance(stmt, SelectStmt):
+                return self._execute_select(stmt)
+            if isinstance(stmt, InsertStmt):
+                return self._execute_insert(stmt)
+            if isinstance(stmt, UpdateStmt):
+                return self._execute_update(stmt)
+            if isinstance(stmt, DeleteStmt):
+                return self._execute_delete(stmt)
+            if isinstance(stmt, CreateIndexStatement):
+                return self._execute_create_index(stmt)
+            if isinstance(stmt, DropTableStmt):
+                return self._execute_drop_table(stmt)
+            if isinstance(stmt, DropIndexStatement):
+                return self._execute_drop_index(stmt)
+            if isinstance(stmt, ShowTablesStmt):
+                return self._execute_show_tables()
+            if isinstance(stmt, ShowDatabasesStmt):
+                return self._execute_show_databases()
+            if isinstance(stmt, ShowIndexesStmt):
+                return self._execute_show_indexes(stmt)
+            if isinstance(stmt, DescribeStmt):
+                return self._execute_describe(stmt)
+            if isinstance(stmt, HelpStmt):
+                return self._execute_help(stmt)
 
-        raise Exception("Unsupported SQL statement type.")
+            raise Exception("Unsupported SQL statement type.")
+
+        finally:
+            # --- ALWAYS CLEAN UP TEMP COLLECTIONS ---
+            self._cleanup_temp_collections()
 
     # ------------------------------------------------------------
     # SELECT EXECUTION (TOP LEVEL)
@@ -1055,45 +1177,75 @@ class SQLToMongoTranslator:
         result = self._eval_select(stmt, plan_lines)
 
         return {
-            "sql": self._reconstruct_sql(stmt),
-            "mongo_plan": "\n".join(plan_lines),
-            "result": result
+            "sql": str(stmt),
+            "mongo": {},
+            "mongo_plan": {},
+            "result": result,
+            "plan": plan_lines,
         }
 
     # ------------------------------------------------------------
     # BOTTOM-UP SELECT EVALUATION
     # ------------------------------------------------------------
+    def _eval_from_source(self, source: Any, plan: List[str]):
+        if isinstance(source, JoinRef):
+            return self._eval_join(source, plan)
+        if isinstance(source, TableAlias):
+            return self._eval_table_alias(source, plan)
+        if isinstance(source, TableRef):
+            return self._eval_table(source, plan)
+        if isinstance(source, SubqueryRef):
+            return self._eval_subquery(source.select, plan)
+        raise Exception(f"Unsupported FROM source: {source}")
+    
     def _eval_select(self, stmt: SelectStmt, plan: List[str]) -> List[Dict[str, Any]]:
-        """
-        Evaluate SELECT bottom-up.
-        If FROM is a subquery, evaluate it first and materialize into a temp collection.
-        """
+        # 0. If FROM contains a JOIN, pipeline must NOT be used
+        if isinstance(stmt.from_source, JoinRef):
+            plan.append("JOIN detected → using JOIN engine")
+            return self._eval_select_join(stmt, plan)
 
-        # 1. Resolve FROM source
-        if isinstance(stmt.from_source, TableRef):
-            coll_name = stmt.from_source.name
-            plan.append(f"FROM TABLE: {coll_name}")
-            _log_debug(f"Reading from collection '{coll_name}'")
-            base_coll = self.mongo.mm_database[coll_name]
-
-        elif isinstance(stmt.from_source, SubqueryRef):
-            plan.append("FROM SUBQUERY → materializing")
-            _log_light("Materializing subquery")
-
-            temp_name = self._materialize_subquery(stmt.from_source.select, plan)
-            base_coll = self.mongo.mm_database[temp_name]
-            plan.append(f"SUBQUERY MATERIALIZED AS: {temp_name}")
-
-        else:
-            raise Exception("Invalid FROM source")
+        # Otherwise use the existing pipeline/find logic
+        return self._eval_select_nopipeline(stmt, plan)
+    
+    def _eval_select_join(self, stmt: SelectStmt, plan: List[str]):
+        # 1. Evaluate FROM (JOIN)
+        rows = self._eval_from_source(stmt.from_source, plan)
 
         # 2. WHERE
+        if stmt.where:
+            rows = [r for r in rows if self._eval_where(stmt.where, r)]
+
+        # 3. ORDER BY
+        if stmt.order_by:
+            for field, direction in reversed(stmt.order_by):
+                rows.sort(key=lambda r: self._eval_order_key(field, r),
+                        reverse=(direction == -1))
+
+        # 4. LIMIT / OFFSET
+        if stmt.offset:
+            rows = rows[stmt.offset:]
+        if stmt.limit:
+            rows = rows[:stmt.limit]
+
+        # 5. Projection
+        return self._apply_projection(stmt.fields, rows, plan)
+    
+    def _eval_select_nopipeline(self, stmt: SelectStmt, plan: List[str]) -> List[Dict[str, Any]]:
+
+        # 1. Resolve FROM source into rows (tables, subqueries, joins)
+        rows = self._eval_from_source(stmt.from_source, plan)
+
+        # 2. Materialize rows into a temp collection so Mongo can query it
+        temp_name = self._materialize_temp(rows)
+        base_coll = self.mongo.mm_database[temp_name]
+
+        # 3. WHERE
         mongo_filter = {}
         if stmt.where:
             mongo_filter = self._compile_where(stmt.where, plan)
             plan.append(f"WHERE FILTER: {mongo_filter}")
 
-        # 3. ORDER BY
+        # 4. ORDER BY
         sort_spec = None
         if stmt.order_by:
             sort_spec = []
@@ -1101,7 +1253,7 @@ class SQLToMongoTranslator:
                 sort_spec.append((field, direction))
             plan.append(f"ORDER BY: {sort_spec}")
 
-        # 4. LIMIT / OFFSET
+        # 5. LIMIT / OFFSET
         limit = stmt.limit
         offset = stmt.offset
         if limit is not None:
@@ -1109,21 +1261,17 @@ class SQLToMongoTranslator:
         if offset is not None:
             plan.append(f"OFFSET: {offset}")
 
-        # 5. Detect expressions in SELECT list
+        # 6. Detect expressions in SELECT list
         needs_pipeline = False
         for f in stmt.fields:
-            if isinstance(f, ColumnAlias):
-                if not isinstance(f.expr, str):
-                    needs_pipeline = True
-                    break
-#        _log_debug(f"needs_pipeline = {needs_pipeline}")
-#        print(needs_pipeline)
+            if isinstance(f, ColumnAlias) and not isinstance(f.expr, str):
+                needs_pipeline = True
+                break
         if needs_pipeline:
             return self._eval_select_pipeline(stmt, plan)
 
-        # 6. Execute Mongo query
+        # 7. Execute Mongo query
         cursor = base_coll.find(mongo_filter)
-
         if sort_spec:
             cursor = cursor.sort(sort_spec)
         if offset:
@@ -1131,59 +1279,25 @@ class SQLToMongoTranslator:
         if limit:
             cursor = cursor.limit(limit)
 
-        docs = []
-        for d in cursor:
-            docs.append(d)
+        docs = list(cursor)
 
-        # 6. DISTINCT (apply AFTER projection)
+        # 8. DISTINCT
         if stmt.distinct:
             plan.append("APPLY DISTINCT")
-
-            # First apply projection so we only dedupe on selected fields
             projected = self._apply_projection(stmt.fields, docs, plan)
 
+            # Deduplicate rows by converting dicts to tuples of sorted items
             seen = set()
-            unique_docs = []
-
+            unique = []
             for row in projected:
-                # Convert lists → tuples so they become hashable
-                def make_hashable(value):
-                    if isinstance(value, list):
-                        converted_list = []
-                        for v in value:
-                            converted_list.append(make_hashable(v))
-                        return tuple(converted_list)
-                    if isinstance(value, dict):
-                        pairs = []
-                        for k in value:
-                            pairs.append((k, make_hashable(value[k])))
-                        for i in range(len(pairs)):
-                            for j in range(i + 1, len(pairs)):
-                                if pairs[j][0] < pairs[i][0]:
-                                    temp_pair = pairs[i]
-                                    pairs[i] = pairs[j]
-                                    pairs[j] = temp_pair
-                        return tuple(pairs)
-                    return value
-
-                row_pairs = []
-                for k in row:
-                    row_pairs.append((k, make_hashable(row[k])))
-                for i in range(len(row_pairs)):
-                    for j in range(i + 1, len(row_pairs)):
-                        if row_pairs[j][0] < row_pairs[i][0]:
-                            temp_pair = row_pairs[i]
-                            row_pairs[i] = row_pairs[j]
-                            row_pairs[j] = temp_pair
-                key = tuple(row_pairs)
-
+                key = tuple(sorted(row.items()))
                 if key not in seen:
                     seen.add(key)
-                    unique_docs.append(row)
+                    unique.append(row)
 
-            return self._convert_object_ids(unique_docs)
+            return self._convert_object_ids(unique)
 
-        # 7. Projection / Aggregates
+        # 9. Projection / Aggregates
         final = self._apply_projection(stmt.fields, docs, plan)
         final = self._convert_object_ids(final)
         return final
@@ -1239,20 +1353,19 @@ class SQLToMongoTranslator:
             raise Exception(f"Unknown boolean operator {expr.op}")
 
         if isinstance(expr, CompareExpr):
-            field = expr.field
+            left = expr.field
+            right = expr.value
             op = expr.op
-            val = self._maybe_convert_objectid(field, expr.value)
-            if op == "=":
-                return {field: val}
-            if op == "<":
-                return {field: {"$lt": val}}
-            if op == "<=":
-                return {field: {"$lte": val}}
-            if op == ">":
-                return {field: {"$gt": val}}
-            if op == ">=":
-                return {field: {"$gte": val}}
-            raise Exception(f"Unknown comparison operator {op}")
+
+            left_is_expr = not isinstance(left, str)
+            right_is_expr = not isinstance(right, (str, int, float))
+
+            # If either side is an expression → use $expr
+            if left_is_expr or right_is_expr:
+                return self._compile_where_expr(expr, plan)
+
+            # Otherwise fall back to simple comparison
+            return self._compile_simple_compare(expr, plan)
 
         if isinstance(expr, LikeExpr):
             regex = expr.pattern.replace("%", ".*")
@@ -1279,6 +1392,7 @@ class SQLToMongoTranslator:
             row = {}
 
             for f in fields:
+                print(f)
                 # Wildcard
                 if f == "*":
                     for k, v in d.items():
@@ -1286,16 +1400,17 @@ class SQLToMongoTranslator:
                     continue
 
                 # ColumnAlias: use alias as key
+                print("Checking for a ColumnAlias")
                 if isinstance(f, ColumnAlias):
+                    print("dealing with a ColumnAlias")
                     alias = f.alias
                     expr = f.expr
 
-                    # For now, support simple field names as expr
-                    if isinstance(expr, str):
-                        row[alias] = d.get(expr)
-                    else:
-                        # Placeholder for expression evaluation
-                        row[alias] = None
+                    print(alias, expr)
+
+                    compiled = self._compile_expr(expr)
+                    row[alias] = self._eval_compiled_expr(compiled, d)
+
                     continue
 
                 # Plain field name
@@ -1618,6 +1733,9 @@ class SQLToMongoTranslator:
 
     def _eval_select_pipeline(self, stmt, plan):
         pipeline = []
+        rows = self._eval_from_source(stmt.from_source, plan)
+        temp_name = self._materialize_temp(rows)
+        base_coll = self.mongo.mm_database[temp_name]
 
         # WHERE
         if stmt.where:
@@ -1651,45 +1769,319 @@ class SQLToMongoTranslator:
         # LIMIT
         if stmt.limit:
             pipeline.append({"$limit": stmt.limit})
+        
+        docs = base_coll.aggregate(pipeline)  # <-- use base_coll, not self.mongo.mm_collection
+        docs = list(docs)
 
-        docs = self.mongo.mm_collection.aggregate(pipeline)
         return list(docs)
     
     def _compile_expr(self, expr):
-        # Numeric literal
+        try:
+            _log_debug(f"COMPILE EXPR: {expr} ({type(expr)})")
+
+            # Numeric literal
+            if isinstance(expr, (int, float)):
+                return expr
+            
+            # Literal string or simple identifier
+            if isinstance(expr, str):
+                # In this engine, strings in expressions are treated as
+                # field references when used in projection.
+                return f"${expr}"
+
+            # Column reference (qualified or unqualified)
+            if isinstance(expr, ColumnRef):
+                # Your join engine produces flat rows: the fields from
+                # both tables are merged into a single dict, not nested
+                # under table aliases. So we always project by field name.
+                #
+                # s.title  -> "$title"
+                # a.name   -> "$name"
+                return f"${expr.name}"
+
+            # Arithmetic expression
+            if isinstance(expr, ArithExpr):
+                left = self._compile_expr(expr.left)
+                right = self._compile_expr(expr.right)
+
+                if expr.op == "+":
+                    return {"$add": [left, right]}
+                if expr.op == "-":
+                    return {"$subtract": [left, right]}
+                if expr.op == "*":
+                    return {"$multiply": [left, right]}
+                if expr.op == "/":
+                    return {"$divide": [left, right]}
+
+            # Unary expression
+            if isinstance(expr, UnaryExpr):
+                operand = self._compile_expr(expr.operand)
+                if expr.op == "-":
+                    return {"$multiply": [-1, operand]}
+                if expr.op == "NOT":
+                    return {"$not": [operand]}
+
+            # Function call
+            if isinstance(expr, FuncExpr):
+                name = expr.name.upper()
+                args = [self._compile_expr(a) for a in expr.args]
+
+                if name == "ABS":
+                    return {"$abs": args[0]}
+                if name == "LOWER":
+                    return {"$toLower": args[0]}
+                if name == "UPPER":
+                    return {"$toUpper": args[0]}
+                if name == "ROUND":
+                    # ROUND(x) or ROUND(x, n)
+                    if len(args) == 1:
+                        return {"$round": [args[0], 0]}
+                    return {"$round": args}
+                if name == "FLOOR":
+                    return {"$floor": args[0]}
+                if name == "CEIL":
+                    return {"$ceil": args[0]}
+                if name == "SQRT":
+                    return {"$sqrt": args[0]}
+                if name == "EXP":
+                    return {"$exp": args[0]}
+                if name == "LOG":
+                    # LOG(x) → natural log
+                    return {"$ln": args[0]}
+                if name == "POWER" or name == "POW":
+                    return {"$pow": args}
+                if name == "CONCAT":
+                    return {"$concat": args}
+
+            raise Exception(f"Unsupported expression type: {expr}")
+
+        except Exception as e:
+            _log_debug(f"EXPR ERROR: {e}")
+            raise
+
+        return None
+    
+    def _compile_where_expr(self, expr, plan):
+        _log_debug(f"WHERE EXPR: {expr}")
+        try:
+            left = self._compile_expr(expr.field)
+            right = self._compile_expr(expr.value)
+
+            op = expr.op
+
+            if op == "=":
+                return {"$expr": {"$eq": [left, right]}}
+            if op == "<":
+                return {"$expr": {"$lt": [left, right]}}
+            if op == "<=":
+                return {"$expr": {"$lte": [left, right]}}
+            if op == ">":
+                return {"$expr": {"$gt": [left, right]}}
+            if op == ">=":
+                return {"$expr": {"$gte": [left, right]}}
+
+            raise Exception(f"Unsupported comparison operator in expression WHERE: {op}")
+        except Exception as e:
+            _log_debug(f"WHERE EXPR ERROR: {e}")
+            raise
+    
+    def _compile_simple_compare(self, expr, plan):
+        field = expr.field
+        op = expr.op
+        val = expr.value
+
+        if op == "=":
+            return {field: val}
+        if op == "<":
+            return {field: {"$lt": val}}
+        if op == "<=":
+            return {field: {"$lte": val}}
+        if op == ">":
+            return {field: {"$gt": val}}
+        if op == ">=":
+            return {field: {"$gte": val}}
+
+        raise Exception(f"Unknown comparison operator {op}")
+    
+    def _flip_join_condition(self, expr: Any) -> Any:
+        if isinstance(expr, CompareExpr):
+            return CompareExpr(field=expr.value, op=expr.op, value=expr.field)
+        return expr
+    
+    def _eval_join(self, join: JoinRef, plan: List[str]) -> List[Dict]:
+        left_rows = self._eval_from_source(join.left, plan)
+        right_rows = self._eval_from_source(join.right, plan)
+
+        results: List[Dict] = []
+
+        for L in left_rows:
+            matched = False
+            for R in right_rows:
+                if self._eval_join_condition(join.on, L, R):
+                    results.append(self._merge_rows(L, R))
+                    matched = True
+
+            if join.join_type == "LEFT" and not matched:
+                results.append(self._merge_rows(L, {}))
+
+        plan.append(f"JOIN PRODUCED {len(results)} ROWS")
+        return results
+
+    def _merge_rows(self, left: Dict, right: Dict) -> Dict:
+        out: Dict = {}
+
+        # left wins by default
+        for k, v in left.items():
+            out[k] = v
+
+        for k, v in right.items():
+            if k in out:
+                out[f"right_{k}"] = v
+            else:
+                out[k] = v
+
+        return out
+    
+    def _eval_join_condition(self, expr: Any, L: Dict, R: Dict) -> bool:
+        return bool(self._eval_condition_expr(expr, L, R))
+
+
+    def _eval_condition_expr(self, expr: Any, L: Dict, R: Dict) -> Any:
+        # BinaryExpr (AND / OR)
+        if isinstance(expr, BinaryExpr):
+            left = self._eval_condition_expr(expr.left, L, R)
+            right = self._eval_condition_expr(expr.right, L, R)
+            if expr.op == "AND":
+                return bool(left) and bool(right)
+            if expr.op == "OR":
+                return bool(left) or bool(right)
+
+        # CompareExpr
+        if isinstance(expr, CompareExpr):
+            left = self._eval_value_expr(expr.field, L, R)
+            right = self._eval_value_expr(expr.value, L, R)
+            op = expr.op
+            if op == "=":
+                return left == right
+            if op == "<":
+                return left < right
+            if op == "<=":
+                return left <= right
+            if op == ">":
+                return left > right
+            if op == ">=":
+                return left >= right
+            return False
+
+        # LikeExpr / InSubqueryExpr could be added here later
+
+        # Fallback: treat as truthy
+        return bool(self._eval_value_expr(expr, L, R))
+    
+    def _eval_value_expr(self, expr: Any, L: Dict, R: Dict) -> Any:
+        # Identifier: possibly qualified (a.field or field)
+        if isinstance(expr, str):
+            if "." in expr:
+                alias, field = expr.split(".", 1)
+                # try left then right
+                if alias in L and field in L:
+                    return L[field]
+                if alias in R and field in R:
+                    return R[field]
+                return None
+            # unqualified
+            if expr in L:
+                return L[expr]
+            if expr in R:
+                return R[expr]
+            return None
+
+        # Reuse your existing expression evaluator if you have one
+        # or map ArithExpr / FuncExpr / UnaryExpr similarly to _compile_expr
+        if isinstance(expr, ArithExpr) or isinstance(expr, UnaryExpr) or isinstance(expr, FuncExpr):
+            # simplest: delegate to Mongo via _compile_expr and run in aggregation,
+            # but for now you can keep ON clauses simple (field = field)
+            return None
+
+        # Literal
         if isinstance(expr, (int, float)):
             return expr
 
-        # Field or literal string
-        if isinstance(expr, str):
-            if expr.isidentifier():
-                return f"${expr}"
-            return expr
+        return None
+    
+    def _materialize_temp(self, rows: List[Dict]) -> str:
+        temp_name = f"_tmp_join_{uuid.uuid4().hex[:8]}"
+        coll = self.mongo.mm_database[temp_name]
+        if rows:
+            coll.insert_many(rows)
+        return temp_name
+    
+    def _eval_table(self, table_ref: TableRef, plan: List[str]) -> List[Dict]:
+        coll_name = table_ref.name
+        plan.append(f"FROM TABLE: {coll_name}")
+        coll = self.mongo.mm_database[coll_name]
+        return list(coll.find({}))
 
-        # Arithmetic expression
-        if isinstance(expr, ArithExpr):
-            left = self._compile_expr(expr.left)
-            right = self._compile_expr(expr.right)
+    
+    def _eval_table_alias(self, table_alias: TableAlias, plan: List[str]) -> List[Dict]:
+        coll_name = table_alias.source.name
+        plan.append(f"FROM TABLE: {coll_name} AS {table_alias.alias}")
+        coll = self.mongo.mm_database[coll_name]
+        return list(coll.find({}))
 
-            if expr.op == "+":
-                return {"$add": [left, right]}
-            if expr.op == "-":
-                return {"$subtract": [left, right]}
-            if expr.op == "*":
-                return {"$multiply": [left, right]}
-            if expr.op == "/":
-                return {"$divide": [left, right]}
+    def _eval_subquery(self, select: SelectStmt, plan: List[str]) -> str:
+        temp_name = self._materialize_subquery(select, plan)
+        plan.append(f"SUBQUERY MATERIALIZED AS: {temp_name}")
+        coll = self.mongo.mm_database[temp_name]
+        return list(coll.find({}))
+    
+    def _eval_compiled_expr(self, compiled, row):
+        # Literal number
+        if isinstance(compiled, (int, float)):
+            return compiled
 
-        # Unary expression
-        if isinstance(expr, UnaryExpr):
-            operand = self._compile_expr(expr.operand)
-            if expr.op == "-":
-                return {"$multiply": [-1, operand]}
-            if expr.op == "NOT":
-                return {"$not": [operand]}
+        # Simple field reference: "$title"
+        if isinstance(compiled, str) and compiled.startswith("$"):
+            field = compiled[1:]
+            return row.get(field)
+
+        # Arithmetic: {"$add": [left, right]}
+        if isinstance(compiled, dict) and "$add" in compiled:
+            left, right = compiled["$add"]
+            return self._eval_compiled_expr(left, row) + self._eval_compiled_expr(right, row)
+
+        if isinstance(compiled, dict) and "$subtract" in compiled:
+            left, right = compiled["$subtract"]
+            return self._eval_compiled_expr(left, row) - self._eval_compiled_expr(right, row)
+
+        if isinstance(compiled, dict) and "$multiply" in compiled:
+            left, right = compiled["$multiply"]
+            return self._eval_compiled_expr(left, row) * self._eval_compiled_expr(right, row)
+
+        if isinstance(compiled, dict) and "$divide" in compiled:
+            left, right = compiled["$divide"]
+            return self._eval_compiled_expr(left, row) / self._eval_compiled_expr(right, row)
+
+        # (You can extend this with function evaluation as needed.)
 
         return None
+    
+    def _cleanup_temp_collections(self):
+        db = self.mongo.mm_database
+        if db is None:
+            return
 
+        for name in db.list_collection_names():
+            if (
+                name.startswith("_tmp_") or
+                name.startswith("tmp_select_") or
+                name.startswith("_sql_tmp_")
+            ):
+                try:
+                    db.drop_collection(name)
+                    _log_debug(f"Dropped temp collection: {name}")
+                except Exception as e:
+                    _log_debug(f"Failed to drop temp collection {name}: {e}")
 # ============================================================
 # END OF SQLToMongoTranslator
 # ============================================================
