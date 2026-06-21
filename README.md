@@ -67,3 +67,66 @@ You will need:
 - **MongoDB Community Edition** or access to a MongoDB instance  
 - The following Python modules:
 
+json, bson, fastapi, pydantic, pymongo
+functools, typing, pathlib, re, uvicorn
+datetime, os, sys
+
+
+Most of these can be installed with:
+
+pip install fastapi pymongo pydantic bson uvicorn
+
+
+## Installation
+A complete installation and setup guide is available in the project’s documentation on the GitHub repository.  
+This includes:
+
+- Installing MongoDB  
+- Preparing test data  
+- Setting up HTTPS certificates (optional)  
+- Running the server  
+- Using the Swagger UI  
+
+The README keeps things simple, but the full instructions walk through everything step by step.
+
+## Quick Start
+Once the dependencies are installed and MongoDB is running:
+
+1. Place the three Python files (`MongoManager.py`, `SQLtoMongo.py`, and `MongoManager_SwaggerUI.py`) in the same directory.  
+2. (Optional) Add a `security` directory with `cert.pem` and `key.pem` for HTTPS.  
+3. Start the server:
+
+python3 MongoManager_SwaggerUI.py
+
+4. Open your browser and go to:
+
+http://localhost:8000/docs
+
+or, if using HTTPS:
+
+https://localhost:8000/docs
+
+
+5. Use the **authenticate** function to connect to your MongoDB instance.  
+6. Select or create a database and collection.  
+7. Explore the available operations, including the SQL helper.
+
+## Test Data
+For testing, you can use the Billboard Top 100 dataset provided by Michael Hollingshead:
+
+https://github.com/mhollingshead/billboard-hot-100
+
+A flattened version of the JSON file is included in the project’s resources for easier loading.
+
+## License
+This project is provided for educational and demonstration purposes.  
+Feel free to explore, learn from it, and adapt it as needed.
+
+## Acknowledgments
+- MongoDB Community Edition  
+- FastAPI and Pydantic  
+- Michael Hollingshead for the Billboard dataset  
+
+
+
+
