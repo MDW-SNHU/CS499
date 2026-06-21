@@ -53,6 +53,10 @@
 # June 21, 2026
 # ---
 
+# ---
+# Python modules necessary for functionality.  The class needs to be able to operate separately from the python artifact
+#     module that's using it.
+# ---
 from ast import stmt
 import os
 import re
@@ -64,9 +68,9 @@ from typing import Any, List, Optional, Dict
 from bson import ObjectId
 
 
-# ============================================================
+# ---
 # LOGGING HELPERS
-# ============================================================
+# ---
 
 LOGLEVEL = os.getenv("SQL2MONGO_LOGLEVEL", "NONE").upper()
 
@@ -79,9 +83,9 @@ def _log_debug(msg: str):
         print(f"[SQL2MONGO DEBUG] {msg}")
 
 
-# ============================================================
+# ---
 # TOKENIZER
-# ============================================================
+# ---
 
 class TokenType(Enum):
     IDENT = auto()
@@ -111,9 +115,9 @@ class Token:
     position: int
 
 
-# ============================================================
+# ---
 # AST NODES
-# ============================================================
+# ---
 
 @dataclass
 class SelectStmt:
@@ -266,9 +270,9 @@ class JoinRef:
     on: Any
     join_type: str  # "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS"
 
-# ============================================================
+# ---
 # LEXER
-# ============================================================
+# ---
 
 class Lexer:
     def __init__(self, text: str):
@@ -397,9 +401,9 @@ class Lexer:
         toks.append(Token(TokenType.EOF, "", self.pos))
         return toks
 
-# ============================================================
+# ---
 # PARSER
-# ============================================================
+# ---
 
 class Parser:
     def __init__(self, tokens: List[Token]):
@@ -430,9 +434,9 @@ class Parser:
 
         raise Exception(f"Unsupported SQL command: {tok.value}")
 
-    # ------------------------------------------------------------
+    # ---
     # SELECT
-    # ------------------------------------------------------------
+    # ---
     def parse_select(self) -> SelectStmt:
         self._expect_kw("SELECT")
         distinct = False
@@ -490,33 +494,33 @@ class Parser:
     def parse_select_item(self) -> Any:
         tok = self._current()
 
-        # 1. Handle "*"
+        # Handle "*"
         if tok.type == TokenType.STAR:
             self._advance()
             return "*"
 
-        # 2. Handle subquery in SELECT list:  (SELECT ...)
+        # Handle subquery in SELECT list:  (SELECT ...)
         if tok.type == TokenType.LPAREN:
             self._advance()
             expr = self.parse_add()
             self._expect(TokenType.RPAREN)
             return self._maybe_parse_column_alias(expr)
 
-        # 3. Handle full SQL expressions (identifiers, arithmetic, functions, parentheses, etc.)
+        # Handle full SQL expressions (identifiers, arithmetic, functions, parentheses, etc.)
         expr = self.parse_add()
 
-        # 4. Explicit alias: AS alias
+        # Explicit alias: AS alias
         if self._current().type == TokenType.KEYWORD and self._current().value.upper() == "AS":
             self._advance()
             alias = self._expect(TokenType.IDENT).value
             return ColumnAlias(expr=expr, alias=alias)
 
-        # 5. Implicit alias: expr alias
+        # Implicit alias: expr alias
         if self._current().type == TokenType.IDENT:
             alias = self._advance().value
             return ColumnAlias(expr=expr, alias=alias)
 
-        # 6. No alias
+        # No alias
         return expr
     
     def parse_from_source(self) -> Any:
@@ -611,9 +615,9 @@ class Parser:
             items.append((field, direction))
         return items
 
-    # ------------------------------------------------------------
+    # ---
     # WHERE expressions
-    # ------------------------------------------------------------
+    # ---
     def parse_expr(self) -> Any:
         return self.parse_or()
 
@@ -766,9 +770,9 @@ class Parser:
 
         raise Exception(f"Unexpected token in expression: {tok.value}")
 
-    # ------------------------------------------------------------
+    # ---
     # INSERT
-    # ------------------------------------------------------------
+    # ---
     def parse_insert(self) -> InsertStmt:
         self._expect_kw("INSERT")
         self._expect_kw("INTO")
@@ -795,9 +799,9 @@ class Parser:
 
         return InsertStmt(table=table, columns=columns, values=values)
 
-    # ------------------------------------------------------------
+    # ---
     # UPDATE
-    # ------------------------------------------------------------
+    # ---
     def parse_update(self) -> UpdateStmt:
         self._expect_kw("UPDATE")
         table = self._expect(TokenType.IDENT).value
@@ -821,9 +825,9 @@ class Parser:
         val = self.parse_add()
         return UpdateSetItem(column=col, value=val)
 
-    # ------------------------------------------------------------
+    # ---
     # DELETE
-    # ------------------------------------------------------------
+    # ---
     def parse_delete(self) -> DeleteStmt:
         self._expect_kw("DELETE")
         self._expect_kw("FROM")
@@ -834,9 +838,9 @@ class Parser:
             where = self.parse_expr()
         return DeleteStmt(table=table, where=where)
     
-    # ------------------------------------------------------------
+    # ---
     # CREATE
-    # ------------------------------------------------------------
+    # ---
     def parse_create_index(self):
         self._expect_kw("CREATE")
 
@@ -872,9 +876,9 @@ class Parser:
 
         return CreateIndexStatement(name=name, table=table, fields=fields, unique=unique)
     
-    # ------------------------------------------------------------
+    # ---
     # DROP (INDEX or TABLE)
-    # ------------------------------------------------------------
+    # ---
     def parse_drop(self):
         self._expect_kw("DROP")
         if self._peek_next_keyword("TABLE"):
@@ -898,9 +902,9 @@ class Parser:
 
         raise Exception("Unsupported DROP command")
     
-    # ------------------------------------------------------------
+    # ---
     # SHOW
-    # ------------------------------------------------------------ 
+    # ---
     def parse_show(self):
         self._expect_kw("SHOW")
 
@@ -923,17 +927,17 @@ class Parser:
 
         return "Unsupported SHOW command."
     
-    # ------------------------------------------------------------
+    # ---
     # DESCRIBE
-    # ------------------------------------------------------------
+    # ---
     def parse_describe(self) -> str:
         self._expect_kw("DESCRIBE")
         table = self._expect(TokenType.IDENT).value
         return DescribeStmt(table=table)
     
-    # ------------------------------------------------------------
+    # ---
     # HELP
-    # ------------------------------------------------------------
+    # ---
     def parse_help(self) -> HelpStmt:
         # Consume the HELP keyword
         self._expect_kw("HELP")
@@ -944,9 +948,9 @@ class Parser:
             topic = self._advance().value
 
         return HelpStmt(topic=topic)
-    # ============================================================
+    # ---
     # HELPER FUNCTIONS
-    # ============================================================
+    # ---
     def _peek_keyword(self, value: str) -> bool:
             tok = self._current()
             return tok.type == TokenType.KEYWORD and tok.value.upper() == value.upper()    
@@ -1009,9 +1013,9 @@ class Parser:
             return TableAlias(source=source, alias=alias)
         return source
     
-# ============================================================
+# ---
 # SQL ENGINE
-# ============================================================
+# ---
 
 class SQLToMongoTranslator:
     def __init__(self, mongo_manager: Any):
@@ -1034,17 +1038,10 @@ class SQLToMongoTranslator:
 
         self._detect_privileges()
     
-    # ------------------------------------------------------------
-    # OPTION C PRIVILEGE DETECTION
-    # ------------------------------------------------------------
+    # ---
+    # PRIVILEGE DETECTION
+    # ---
     def _detect_privileges(self):
-        """
-        Option C:
-        1. Try connectionStatus (if available)
-        2. If that fails, try creating/dropping a dummy DB
-        3. If that fails, try creating/dropping a dummy collection
-        4. If that fails, user is read-only
-        """
 
         db = getattr(self.mongo, "mm_database", None)
         if db is None:
@@ -1122,9 +1119,9 @@ class SQLToMongoTranslator:
         self.has_db_write = False
         _log_debug("User is fully read-only.")
 
-    # ------------------------------------------------------------
+    # ---
     # SQL ENTRY POINT
-    # ------------------------------------------------------------
+    # ---
     def translate_sql(self, sql: str) -> Dict[str, Any]:
         sql = sql.strip()
         if sql.endswith(";"):
@@ -1164,12 +1161,12 @@ class SQLToMongoTranslator:
             raise Exception("Unsupported SQL statement type.")
 
         finally:
-            # --- ALWAYS CLEAN UP TEMP COLLECTIONS ---
+            # ---
             self._cleanup_temp_collections()
 
-    # ------------------------------------------------------------
+    # ---
     # SELECT EXECUTION (TOP LEVEL)
-    # ------------------------------------------------------------
+    # ---
     def _execute_select(self, stmt: SelectStmt) -> Dict[str, Any]:
         _log_light("Executing SELECT statement")
 
@@ -1184,9 +1181,9 @@ class SQLToMongoTranslator:
             "plan": plan_lines,
         }
 
-    # ------------------------------------------------------------
+    # ---
     # BOTTOM-UP SELECT EVALUATION
-    # ------------------------------------------------------------
+    # ---
     def _eval_from_source(self, source: Any, plan: List[str]):
         if isinstance(source, JoinRef):
             return self._eval_join(source, plan)
@@ -1199,7 +1196,7 @@ class SQLToMongoTranslator:
         raise Exception(f"Unsupported FROM source: {source}")
     
     def _eval_select(self, stmt: SelectStmt, plan: List[str]) -> List[Dict[str, Any]]:
-        # 0. If FROM contains a JOIN, pipeline must NOT be used
+        # If FROM contains a JOIN, pipeline must NOT be used
         if isinstance(stmt.from_source, JoinRef):
             plan.append("JOIN detected → using JOIN engine")
             return self._eval_select_join(stmt, plan)
@@ -1208,44 +1205,44 @@ class SQLToMongoTranslator:
         return self._eval_select_nopipeline(stmt, plan)
     
     def _eval_select_join(self, stmt: SelectStmt, plan: List[str]):
-        # 1. Evaluate FROM (JOIN)
+        # Evaluate FROM (JOIN)
         rows = self._eval_from_source(stmt.from_source, plan)
 
-        # 2. WHERE
+        # WHERE
         if stmt.where:
             rows = [r for r in rows if self._eval_where(stmt.where, r)]
 
-        # 3. ORDER BY
+        # ORDER BY
         if stmt.order_by:
             for field, direction in reversed(stmt.order_by):
                 rows.sort(key=lambda r: self._eval_order_key(field, r),
                         reverse=(direction == -1))
 
-        # 4. LIMIT / OFFSET
+        # LIMIT / OFFSET
         if stmt.offset:
             rows = rows[stmt.offset:]
         if stmt.limit:
             rows = rows[:stmt.limit]
 
-        # 5. Projection
+        # Projection
         return self._apply_projection(stmt.fields, rows, plan)
     
     def _eval_select_nopipeline(self, stmt: SelectStmt, plan: List[str]) -> List[Dict[str, Any]]:
 
-        # 1. Resolve FROM source into rows (tables, subqueries, joins)
+        # Resolve FROM source into rows (tables, subqueries, joins)
         rows = self._eval_from_source(stmt.from_source, plan)
 
-        # 2. Materialize rows into a temp collection so Mongo can query it
+        # Materialize rows into a temp collection so Mongo can query it
         temp_name = self._materialize_temp(rows)
         base_coll = self.mongo.mm_database[temp_name]
 
-        # 3. WHERE
+        # WHERE
         mongo_filter = {}
         if stmt.where:
             mongo_filter = self._compile_where(stmt.where, plan)
             plan.append(f"WHERE FILTER: {mongo_filter}")
 
-        # 4. ORDER BY
+        # ORDER BY
         sort_spec = None
         if stmt.order_by:
             sort_spec = []
@@ -1253,7 +1250,7 @@ class SQLToMongoTranslator:
                 sort_spec.append((field, direction))
             plan.append(f"ORDER BY: {sort_spec}")
 
-        # 5. LIMIT / OFFSET
+        # LIMIT / OFFSET
         limit = stmt.limit
         offset = stmt.offset
         if limit is not None:
@@ -1261,7 +1258,7 @@ class SQLToMongoTranslator:
         if offset is not None:
             plan.append(f"OFFSET: {offset}")
 
-        # 6. Detect expressions in SELECT list
+        # Detect expressions in SELECT list
         needs_pipeline = False
         for f in stmt.fields:
             if isinstance(f, ColumnAlias) and not isinstance(f.expr, str):
@@ -1270,7 +1267,7 @@ class SQLToMongoTranslator:
         if needs_pipeline:
             return self._eval_select_pipeline(stmt, plan)
 
-        # 7. Execute Mongo query
+        # Execute Mongo query
         cursor = base_coll.find(mongo_filter)
         if sort_spec:
             cursor = cursor.sort(sort_spec)
@@ -1281,7 +1278,7 @@ class SQLToMongoTranslator:
 
         docs = list(cursor)
 
-        # 8. DISTINCT
+        # DISTINCT
         if stmt.distinct:
             plan.append("APPLY DISTINCT")
             projected = self._apply_projection(stmt.fields, docs, plan)
@@ -1297,20 +1294,15 @@ class SQLToMongoTranslator:
 
             return self._convert_object_ids(unique)
 
-        # 9. Projection / Aggregates
+        # Projection / Aggregates
         final = self._apply_projection(stmt.fields, docs, plan)
         final = self._convert_object_ids(final)
         return final
 
-    # ------------------------------------------------------------
+    # ---
     # MATERIALIZE SUBQUERY
-    # ------------------------------------------------------------
+    # ---
     def _materialize_subquery(self, sub: SelectStmt, plan: List[str]) -> str:
-        """
-        Evaluate a subquery and store results in a temp collection.
-        Uses temp DB if DB-level write is available, otherwise temp collection in active DB.
-        """
-
         _log_debug("Evaluating subquery bottom-up")
 
         rows = self._eval_select(sub, plan)
@@ -1339,9 +1331,9 @@ class SQLToMongoTranslator:
 
         return temp_name
 
-    # ------------------------------------------------------------
+    # ---
     # WHERE COMPILATION
-    # ------------------------------------------------------------
+    # ---
     def _compile_where(self, expr: Any, plan: List[str]) -> Dict[str, Any]:
         if isinstance(expr, BinaryExpr):
             left = self._compile_where(expr.left, plan)
@@ -1382,9 +1374,9 @@ class SQLToMongoTranslator:
 
         raise Exception("Unsupported WHERE expression type")
 
-    # ------------------------------------------------------------
+    # ---
     # PROJECTION & AGGREGATES
-    # ------------------------------------------------------------
+    # ---
     def _apply_projection(self, fields, docs, plan):
         projected = []
 
@@ -1422,15 +1414,15 @@ class SQLToMongoTranslator:
 
         return projected
 
-    # ------------------------------------------------------------
+    # ---
     # SQL RECONSTRUCTION (for debugging)
-    # ------------------------------------------------------------
+    # ---
     def _reconstruct_sql(self, stmt: SelectStmt) -> str:
         return "<SQL reconstruction omitted>"
 
-    # ------------------------------------------------------------
+    # ---
     # INSERT EXECUTION
-    # ------------------------------------------------------------
+    # ---
     def _execute_insert(self, stmt: InsertStmt) -> Dict[str, Any]:
         if self.read_only:
             raise Exception("User does not have write privileges (INSERT blocked).")
@@ -1463,9 +1455,9 @@ class SQLToMongoTranslator:
             "result": {"inserted": 1}
         }
 
-    # ------------------------------------------------------------
+    # ---
     # UPDATE EXECUTION
-    # ------------------------------------------------------------
+    # ---
     def _execute_update(self, stmt: UpdateStmt) -> Dict[str, Any]:
         if self.read_only:
             raise Exception("User does not have write privileges (UPDATE blocked).")
@@ -1492,9 +1484,9 @@ class SQLToMongoTranslator:
             "result": {"matched": res.matched_count, "modified": res.modified_count}
         }
 
-    # ------------------------------------------------------------
+    # ---
     # DELETE EXECUTION
-    # ------------------------------------------------------------
+    # ---
     def _execute_delete(self, stmt: DeleteStmt) -> Dict[str, Any]:
         if self.read_only:
             raise Exception("User does not have write privileges (DELETE blocked).")
@@ -1770,7 +1762,7 @@ class SQLToMongoTranslator:
         if stmt.limit:
             pipeline.append({"$limit": stmt.limit})
         
-        docs = base_coll.aggregate(pipeline)  # <-- use base_coll, not self.mongo.mm_collection
+        docs = base_coll.aggregate(pipeline)
         docs = list(docs)
 
         return list(docs)
@@ -1791,12 +1783,6 @@ class SQLToMongoTranslator:
 
             # Column reference (qualified or unqualified)
             if isinstance(expr, ColumnRef):
-                # Your join engine produces flat rows: the fields from
-                # both tables are merged into a single dict, not nested
-                # under table aliases. So we always project by field name.
-                #
-                # s.title  -> "$title"
-                # a.name   -> "$name"
                 return f"${expr.name}"
 
             # Arithmetic expression
@@ -1973,13 +1959,10 @@ class SQLToMongoTranslator:
                 return left >= right
             return False
 
-        # LikeExpr / InSubqueryExpr could be added here later
-
         # Fallback: treat as truthy
         return bool(self._eval_value_expr(expr, L, R))
     
     def _eval_value_expr(self, expr: Any, L: Dict, R: Dict) -> Any:
-        # Identifier: possibly qualified (a.field or field)
         if isinstance(expr, str):
             if "." in expr:
                 alias, field = expr.split(".", 1)
@@ -1996,11 +1979,7 @@ class SQLToMongoTranslator:
                 return R[expr]
             return None
 
-        # Reuse your existing expression evaluator if you have one
-        # or map ArithExpr / FuncExpr / UnaryExpr similarly to _compile_expr
         if isinstance(expr, ArithExpr) or isinstance(expr, UnaryExpr) or isinstance(expr, FuncExpr):
-            # simplest: delegate to Mongo via _compile_expr and run in aggregation,
-            # but for now you can keep ON clauses simple (field = field)
             return None
 
         # Literal
@@ -2062,8 +2041,6 @@ class SQLToMongoTranslator:
             left, right = compiled["$divide"]
             return self._eval_compiled_expr(left, row) / self._eval_compiled_expr(right, row)
 
-        # (You can extend this with function evaluation as needed.)
-
         return None
     
     def _cleanup_temp_collections(self):
@@ -2082,11 +2059,6 @@ class SQLToMongoTranslator:
                     _log_debug(f"Dropped temp collection: {name}")
                 except Exception as e:
                     _log_debug(f"Failed to drop temp collection {name}: {e}")
-# ============================================================
+# ---
 # END OF SQLToMongoTranslator
-# ============================================================
-
-# The module ends here.  No additional helper classes or functions
-# are defined beyond this point.  All SQL parsing, privilege
-# detection, nested SELECT evaluation, temp DB/collection handling,
-# and CRUD execution logic is contained within the classes above.
+# ---

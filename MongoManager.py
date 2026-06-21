@@ -115,39 +115,6 @@ class MongoManager(object):
 
         except Exception as e:
             raise Exception(f"Authentication failed: {str(e)}")
-    """
-    def authenticate(self, username=None, password=None, host="127.0.0.1", port=27017, database=None, timeout=3000):
-        # Function establishes a connection to a MongoDB instance and selects a database.
-        #     Not all parameters are necessary, depending on what functions are being performed.
-        #     If unspecified, port will default to 27017, the standard MongoDB port and
-        #     host will default to 127.0.0.1, which is the local host.  If no security is enabled then
-        #     username and password fields are not required and if database is not specified there will 
-        #     be none used.  This will allow for database creation, deletion, switching and listing without issue.
-        #     If username, password, and database are omitted, the main Mongo instance running on the specified host and port
-        #     (or 127.0.0.1:27017) will be connected.
-
-        # Build connection URI depending on what parameters are provided to the function call.
-        if username and password:
-            # Connection being made to a secured mongo instance, provide appropriate uri to handle that.w
-            MongoURI = f"mongodb://{username}:{password}@{host}:{port}"
-        else:
-            # instance is being dealth with as unsecured, no username/password specified in URI.  Should cause auth issue if auth is required.
-            MongoURI = f"mongodb://{host}:{port}"
-
-        try:
-            self.mm_client = MongoClient(MongoURI, serverSelectionTimeoutMS=timeout)
-
-            # test that we got properly connected
-            self.mm_client.admin.command("ping")
-
-            self.mm_database = self.mm_client[database]
-            self.authenticated = True
-
-        except ServerSelectionTimeoutError:
-            raise Exception("Authentication failed: Timed out trying to reach server.")
-        except Exception as e:
-            raise Exception(f"Authentication failed: {str(e)}")
-        """
     # ---
     # This method is used to detect whether the authenticated account has only read access or whether
     #    it can create temporary databases for nested searches and more complex operations.  It was 
