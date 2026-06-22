@@ -1384,7 +1384,6 @@ class SQLToMongoTranslator:
             row = {}
 
             for f in fields:
-                print(f)
                 # Wildcard
                 if f == "*":
                     for k, v in d.items():
