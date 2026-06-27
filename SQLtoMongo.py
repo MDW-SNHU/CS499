@@ -58,7 +58,7 @@
 #     module that's using it.
 # ---
 from ast import stmt
-import os
+import os, sys
 import re
 import uuid
 from datetime import datetime
@@ -269,6 +269,11 @@ class JoinRef:
     right: Any
     on: Any
     join_type: str  # "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS"
+
+@dataclass
+class InListExpr:
+    field: Any
+    list_field: Any  
 
 # ---
 # LEXER
@@ -647,25 +652,23 @@ class Parser:
             self._expect(TokenType.RPAREN)
             return inner
 
-        # LIKE and IN still require an identifier on the left
-        if tok.type == TokenType.IDENT:
-            # Look ahead: is this LIKE or IN?
-            if self._peek().type == TokenType.KEYWORD and self._peek().value == "LIKE":
-                field = self._advance().value
-                self._advance()  # LIKE
-                pattern = self._expect(TokenType.STRING).value
-                return LikeExpr(field=field, pattern=pattern)
+        # First parse the left-hand expression (ColumnRef, literal, function, etc.)
+        left = self.parse_add()
 
-            if self._peek().type == TokenType.KEYWORD and self._peek().value == "IN":
-                field = self._advance().value
-                self._advance()  # IN
-                self._expect(TokenType.LPAREN)
+        # Now check for IN
+        if self._current().type == TokenType.KEYWORD and self._current().value == "IN":
+            self._advance()  # consume IN
+
+            # IN (subquery)
+            if self._current().type == TokenType.LPAREN:
+                self._advance()
                 sub = self.parse_select()
                 self._expect(TokenType.RPAREN)
-                return InSubqueryExpr(field=field, subquery=sub)
+                return InSubqueryExpr(field=left, subquery=sub)
 
-        # Otherwise: parse a full expression on the left
-        left = self.parse_add()
+            # IN column/list field
+            right = self.parse_add()
+            return InListExpr(field=left, list_field=right)
 
         # Comparison operator
         tok = self._current()
@@ -1004,13 +1007,24 @@ class Parser:
         return expr
     
     def _maybe_parse_table_alias(self, source):
-        if self._current().type == TokenType.IDENT and \
-        self._current().value.upper() not in (
-            "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS",
-            "WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING"
-        ):
-            alias = self._advance().value
+        # Explicit alias:  table AS alias
+        if self._current().type == TokenType.KEYWORD and self._current().value == "AS":
+            self._advance()
+            alias = self._expect(TokenType.IDENT).value
             return TableAlias(source=source, alias=alias)
+
+        # Implicit alias:  table alias
+        if self._current().type == TokenType.IDENT:
+            next_val = self._current().value.upper()
+
+            # Do NOT treat SQL clause keywords as aliases
+            if next_val not in (
+                "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS",
+                "WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING", "ON"
+            ):
+                alias = self._advance().value
+                return TableAlias(source=source, alias=alias)
+
         return source
     
 # ---
@@ -1391,13 +1405,9 @@ class SQLToMongoTranslator:
                     continue
 
                 # ColumnAlias: use alias as key
-                print("Checking for a ColumnAlias")
                 if isinstance(f, ColumnAlias):
-                    print("dealing with a ColumnAlias")
                     alias = f.alias
                     expr = f.expr
-
-                    print(alias, expr)
 
                     compiled = self._compile_expr(expr)
                     row[alias] = self._eval_compiled_expr(compiled, d)
@@ -1887,6 +1897,69 @@ class SQLToMongoTranslator:
             return {field: {"$gte": val}}
 
         raise Exception(f"Unknown comparison operator {op}")
+
+    def _eval_expr(self, expr, row):
+        # Column reference
+        if isinstance(expr, ColumnRef):
+            return row.get(expr.name)
+
+        # Literal values
+        if isinstance(expr, (str, int, float)):
+            return expr
+
+        # Arithmetic expressions
+        if isinstance(expr, ArithExpr):
+            left = self._eval_expr(expr.left, row)
+            right = self._eval_expr(expr.right, row)
+            if expr.op == "+": return left + right
+            if expr.op == "-": return left - right
+            if expr.op == "*": return left * right
+            if expr.op == "/": return left / right
+
+        # Unary expressions
+        if isinstance(expr, UnaryExpr):
+            val = self._eval_expr(expr.operand, row)
+            if expr.op == "-": return -val
+            if expr.op == "NOT": return not val
+
+        # Comparison expressions
+        if isinstance(expr, CompareExpr):
+            left = self._eval_expr(expr.field, row)
+            right = self._eval_expr(expr.value, row)
+            if expr.op == "=": return left == right
+            if expr.op == "<": return left < right
+            if expr.op == "<=": return left <= right
+            if expr.op == ">": return left > right
+            if expr.op == ">=": return left >= right
+
+        # LIKE
+        if isinstance(expr, LikeExpr):
+            val = row.get(expr.field) or ""
+            pattern = expr.pattern.replace("%", ".*")
+            return re.match(pattern, val) is not None
+
+        # IN (subquery)
+        if isinstance(expr, InSubqueryExpr):
+            sub_rows = self._eval_select(expr.subquery)
+            left_val = row.get(expr.field)
+            return any(left_val == r.get(expr.field) for r in sub_rows)
+
+        # IN (list field)
+        if isinstance(expr, InListExpr):
+            left_val = self._eval_expr(expr.field, row)
+            right_list = self._eval_expr(expr.list_field, row)
+            if isinstance(right_list, list):
+                return left_val in right_list
+            return False
+
+        # Boolean AND/OR
+        if isinstance(expr, BinaryExpr):
+            left = self._eval_expr(expr.left, row)
+            right = self._eval_expr(expr.right, row)
+            if expr.op == "AND": return left and right
+            if expr.op == "OR": return left or right
+
+        raise Exception(f"Unsupported expression type: {expr}")
     
     def _flip_join_condition(self, expr: Any) -> Any:
         if isinstance(expr, CompareExpr):
@@ -1897,35 +1970,94 @@ class SQLToMongoTranslator:
         left_rows = self._eval_from_source(join.left, plan)
         right_rows = self._eval_from_source(join.right, plan)
 
-        results: List[Dict] = []
+        plan.append(f"JOIN TYPE: {join.join_type}")
 
-        for L in left_rows:
-            matched = False
-            for R in right_rows:
-                if self._eval_join_condition(join.on, L, R):
-                    results.append(self._merge_rows(L, R))
-                    matched = True
+        # ------------------------------------------------------------
+        # Determine join type: equality or IN-list
+        # ------------------------------------------------------------
+        on_expr = join.on
 
-            if join.join_type == "LEFT" and not matched:
-                results.append(self._merge_rows(L, {}))
+        # Case 1: Equality join: a.id = b.id
+        if isinstance(on_expr, CompareExpr) and on_expr.op == "=":
+            left_col = on_expr.field
+            right_col = on_expr.value
 
-        plan.append(f"JOIN PRODUCED {len(results)} ROWS")
-        return results
+            # Build hash table on right side
+            hash_table = {}
+            for r in right_rows:
+                key = r.get(right_col.name)
+                hash_table.setdefault(key, []).append(r)
 
-    def _merge_rows(self, left: Dict, right: Dict) -> Dict:
-        out: Dict = {}
+            # Perform join
+            results = []
+            for L in left_rows:
+                left_key = L.get(left_col.name)
+                matches = hash_table.get(left_key)
 
-        # left wins by default
-        for k, v in left.items():
-            out[k] = v
+                if matches:
+                    for R in matches:
+                        results.append(self._merge_rows(L, R))
+                elif join.join_type == "LEFT":
+                    results.append(self._merge_rows(L, {}))
 
-        for k, v in right.items():
-            if k in out:
-                out[f"right_{k}"] = v
-            else:
-                out[k] = v
+                # Early LIMIT
+                if self._limit_reached(results, plan):
+                    return results
 
-        return out
+            return results
+
+        # Case 2: IN-list join: a.id IN b.list_field
+        if isinstance(on_expr, InListExpr):
+            left_col = on_expr.field
+            right_col = on_expr.list_field
+
+            # Build hash table: normalized right_list_value -> right_row
+            hash_table = {}
+            for r in right_rows:
+                lst = r.get(right_col.name)
+#                for k, v in r.items():
+#                    print(f"{k}: {v}")
+                if isinstance(lst, list):
+                    for item in lst:
+#                        print("RIGHT_ITEM:", item, type(item))
+                        # Normalize item to string
+                        item = str(item)
+                        hash_table.setdefault(item, []).append(r)
+                                                
+            results = []
+            for L in left_rows:
+                left_key = L.get(left_col.name)
+
+#                print("LEFT_KEY:", left_key, type(left_key))
+
+                # Normalize left_key to string
+                left_key = str(left_key)
+
+                matches = hash_table.get(left_key)
+#                print(left_key)
+#                for k, v in hash_table.items():
+#                    print(f"{k}: {len(v)}")
+#                print("Hash: ", hash_table.get(left_key))
+#                sys.exit(0)
+
+#                print("Matches: ", matches)
+
+                if matches:
+                    for R in matches:
+
+#                        print("RIGHT_ITEM:", item, type(item))
+
+                        results.append(self._merge_rows(L, R))
+                elif join.join_type == "LEFT":
+                    results.append(self._merge_rows(L, {}))
+
+                if self._limit_reached(results, plan):
+                    return results
+
+            return results
+
+        # Unsupported join type
+        raise Exception("JOIN ON clause must be a simple equality or IN-list condition.")
     
     def _eval_join_condition(self, expr: Any, L: Dict, R: Dict) -> bool:
         return bool(self._eval_condition_expr(expr, L, R))
@@ -2058,6 +2190,42 @@ class SQLToMongoTranslator:
                     _log_debug(f"Dropped temp collection: {name}")
                 except Exception as e:
                     _log_debug(f"Failed to drop temp collection {name}: {e}")
+
+    def _limit_reached(self, results, plan):
+        for p in plan:
+            if p.startswith("LIMIT"):
+                try:
+                    limit_val = int(p.split(":")[1].strip())
+                    return len(results) >= limit_val
+                except:
+                    return False
+        return False
+    
+    def _merge_rows(self, left_row: dict, right_row: dict) -> dict:
+        """
+        Merge two MongoDB result rows for JOIN operations.
+        If the right row is empty (LEFT JOIN no match), return left row + empty right fields.
+        """
+        if not isinstance(left_row, dict):
+            left_row = {}
+
+        if not isinstance(right_row, dict):
+            right_row = {}
+
+        merged = {}
+
+        # Copy left row fields
+        for k, v in left_row.items():
+            merged[k] = v
+
+        # Copy right row fields, avoiding collisions
+        for k, v in right_row.items():
+            if k in merged:
+                merged[f"right_{k}"] = v
+            else:
+                merged[k] = v
+
+        return merged
 # ---
 # END OF SQLToMongoTranslator
 # ---
