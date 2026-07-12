@@ -1189,6 +1189,8 @@ class SQLToMongoTranslator:
     # ---
     def _execute_select(self, stmt: SelectStmt) -> Dict[str, Any]:
         _log_light("Executing SELECT statement")
+        print("DEBUG SELECT FIELDS:", repr(stmt.fields))
+        print("DEBUG SELECT ORDER_BY:", repr(stmt.order_by))
 
         plan_lines: List[str] = []
         result = self._eval_select(stmt, plan_lines)
@@ -1204,48 +1206,152 @@ class SQLToMongoTranslator:
     # ---
     # BOTTOM-UP SELECT EVALUATION
     # ---
-    def _eval_from_source(self, source: Any, plan: List[str]):
-        if isinstance(source, JoinRef):
-            return self._eval_join(source, plan)
+    def _eval_from_source(self, source, plan):
+        """
+        Evaluates the FROM source:
+        - TableRef
+        - TableAlias
+        - JoinRef
+        - SubqueryRef
+        """
+
+        # Table alias: SELECT ... FROM artists AS a
         if isinstance(source, TableAlias):
             return self._eval_table_alias(source, plan)
+
+        # Plain table reference: SELECT ... FROM artists
         if isinstance(source, TableRef):
             return self._eval_table(source, plan)
+
+        # Subquery reference: SELECT ... FROM (SELECT ...)
         if isinstance(source, SubqueryRef):
-            return self._eval_subquery(source.select, plan)
-        raise Exception(f"Unsupported FROM source: {source}")
-    
-    def _eval_select(self, stmt: SelectStmt, plan: List[str]) -> List[Dict[str, Any]]:
-        # If FROM contains a JOIN, pipeline must NOT be used
+            return self._eval_select(source.select, plan)
+
+        # JOIN reference
+        if isinstance(source, JoinRef):
+            return self._eval_join(source, plan)
+
+        raise ValueError(f"Unsupported FROM source type: {type(source)}")
+
+    def _eval_select(self, stmt: SelectStmt, plan: List[str]):
+        """
+        Dispatch SELECT execution based on whether the FROM clause contains a JOIN.
+        """
+
+        # JOIN path
         if isinstance(stmt.from_source, JoinRef):
-            plan.append("JOIN detected → using JOIN engine")
+            plan.append("JOIN detected → using MongoDB pipeline JOIN engine")
             return self._eval_select_join(stmt, plan)
 
-        # Otherwise use the existing pipeline/find logic
+        # Non-JOIN path (existing behavior)
         return self._eval_select_nopipeline(stmt, plan)
     
-    def _eval_select_join(self, stmt: SelectStmt, plan: List[str]):
-        # Evaluate FROM (JOIN)
-        rows = self._eval_from_source(stmt.from_source, plan)
+    def _eval_select_join(self, stmt, plan):
+        join = stmt.from_source
+        if not isinstance(join, JoinRef):
+            raise ValueError("JOIN expected in _eval_select_join")
 
-        # WHERE
-        if stmt.where:
-            rows = [r for r in rows if self._eval_where(stmt.where, r)]
+        # Resolve left (base) collection
+        if isinstance(join.left, TableAlias):
+            left_name = join.left.source.name
+        else:
+            left_name = join.left.name
 
-        # ORDER BY
+        # Resolve right (joined) collection
+        if isinstance(join.right, TableAlias):
+            right_name = join.right.source.name
+        else:
+            right_name = join.right.name
+
+        base_coll = self.mongo.mm_database[left_name]
+
+        # JOIN condition: b._id IN a.source_ids
+        on = join.on
+        if not isinstance(on, InListExpr):
+            raise ValueError("Only IN-list JOINs supported")
+
+        local_field  = self._resolve_column(on.list_field)   # a.source_ids
+        foreign_field = self._resolve_column(on.field)       # b._id
+
+        pipeline = []
+
+        # ------------------------------------------------------------
+        # 1. JOIN via $lookup
+        # ------------------------------------------------------------
+        pipeline.append({
+            "$lookup": {
+                "from": right_name,
+                "localField": local_field,
+                "foreignField": foreign_field,
+                "as": "joined"
+            }
+        })
+
+        pipeline.append({"$unwind": "$joined"})
+
+        # ------------------------------------------------------------
+        # 2. WHERE clause → $match
+        # ------------------------------------------------------------
+        if stmt.where is not None:
+            mongo_filter = self._compile_where(stmt.where, plan)
+            pipeline.append({"$match": mongo_filter})
+
+        # ------------------------------------------------------------
+        # 3. ORDER BY → $sort
+        # ------------------------------------------------------------
         if stmt.order_by:
-            for field, direction in reversed(stmt.order_by):
-                rows.sort(key=lambda r: self._eval_order_key(field, r),
-                        reverse=(direction == -1))
+            sort_spec = {}
+            for field, direction in stmt.order_by:
+                if field in ("a", "b"):
+                    continue  # ignore alias-only fields
+                sort_spec[field] = -1 if str(direction).upper() == "DESC" else 1
 
-        # LIMIT / OFFSET
-        if stmt.offset:
-            rows = rows[stmt.offset:]
-        if stmt.limit:
-            rows = rows[:stmt.limit]
+            if sort_spec:
+                pipeline.append({"$sort": sort_spec})
 
-        # Projection
-        return self._apply_projection(stmt.fields, rows, plan)
+        # ------------------------------------------------------------
+        # 4. LIMIT → $limit
+        # ------------------------------------------------------------
+        if stmt.limit is not None:
+            pipeline.append({"$limit": stmt.limit})
+
+        # ------------------------------------------------------------
+        # 5. Execute pipeline
+        # ------------------------------------------------------------
+        docs = list(base_coll.aggregate(pipeline))
+        docs = [self._normalize_row(d) for d in docs]
+
+        # ------------------------------------------------------------
+        # 6. Final projection (Python-side)
+        # ------------------------------------------------------------
+        results = []
+        for row in docs:
+            out = {}
+
+            for f in stmt.fields:
+                if f == "*":
+                    for k, v in row.items():
+                        if k != "_id":
+                            out[k] = v
+                    continue
+
+                if isinstance(f, ColumnAlias):
+                    alias = f.alias
+                    compiled = self._compile_expr(f.expr)
+                    out[alias] = self._eval_compiled_expr(compiled, row)
+                    continue
+
+                if isinstance(f, ColumnRef):
+                    compiled = self._compile_expr(f)
+                    out[f.name] = self._eval_compiled_expr(compiled, row)
+                    continue
+
+                compiled = self._compile_expr(f)
+                out[str(f)] = self._eval_compiled_expr(compiled, row)
+
+            results.append(out)
+
+        return results
     
     def _eval_select_nopipeline(self, stmt: SelectStmt, plan: List[str]) -> List[Dict[str, Any]]:
 
@@ -1400,25 +1506,41 @@ class SQLToMongoTranslator:
     # PROJECTION & AGGREGATES
     # ---
     def _apply_projection(self, rows, fields, plan):
-        results = []
+        out_rows = []
 
         for row in rows:
             out = {}
 
             for f in fields:
+                # SELECT * case: parser gave plain "*"
+                if isinstance(f, str) and f == "*":
+                    for k, v in row.items():
+                        out[k] = v
+                    continue
+
+                # ColumnAlias(expr=..., alias=...)
                 if isinstance(f, ColumnAlias):
+                    expr  = f.expr
                     alias = f.alias
-                    compiled = self._compile_expr(f.expr)
-                    value = self._eval_compiled_expr(compiled, row)
-                    out[alias] = value
-                else:
-                    compiled = self._compile_expr(f)
-                    value = self._eval_compiled_expr(compiled, row)
-                    out[f.name] = value
 
-            results.append(out)
+                    if isinstance(expr, ColumnRef):
+                        col = expr.name
+                        out[alias or col] = row.get(col)
+                    else:
+                        value = self._eval_compiled_expr(self._compile_expr(expr), row)
+                        if alias:
+                            out[alias] = value
+                    continue
 
-        return results
+                # Bare ColumnRef (no alias)
+                if isinstance(f, ColumnRef):
+                    col = f.name
+                    out[col] = row.get(col)
+                    continue
+
+            out_rows.append(out)
+
+        return out_rows
 
     # ---
     # INSERT EXECUTION
@@ -1960,155 +2082,84 @@ class SQLToMongoTranslator:
             return CompareExpr(field=expr.value, op=expr.op, value=expr.field)
         return expr
     
-    def _eval_join(self, join, plan):
+    def _eval_join(self, join: JoinRef, plan):
         """
-        Full hash-join engine with support for:
-        - ColumnRef = ColumnRef (equality hash join)
-        - ColumnRef IN list_field (reverse-index hash join)
-        - list_field OVERLAP list_field (set-intersection hash join)
-        - full expression fallback
-        - INNER and LEFT JOIN
-        - LIMIT short-circuiting
+        MongoDB-based JOIN using $lookup with pipeline:
+
+        FROM artists AS a
+        JOIN billboard AS b
+        ON b._id IN a.source_ids
         """
 
-        left_rows = self._eval_from_source(join.left, plan)
-        right_rows = self._eval_from_source(join.right, plan)
-        on_expr = join.on
+        # Resolve left (base) collection name
+        if isinstance(join.left, TableAlias):
+            left_source = join.left.source
+            left_name = left_source.name if isinstance(left_source, TableRef) else getattr(left_source, "name", None)
+        elif isinstance(join.left, TableRef):
+            left_name = join.left.name
+        else:
+            raise ValueError(f"Unsupported left JOIN source: {type(join.left)}")
 
-        # Precompile ON expression once
-        compiled_on = self._compile_expr(on_expr)
+        # Resolve right (joined) collection name
+        if isinstance(join.right, TableAlias):
+            right_source = join.right.source
+            right_name = right_source.name if isinstance(right_source, TableRef) else getattr(right_source, "name", None)
+        elif isinstance(join.right, TableRef):
+            right_name = join.right.name
+        else:
+            raise ValueError(f"Unsupported right JOIN source: {type(join.right)}")
 
-        results = []
+        base_coll = self.mongo.mm_database[left_name]
 
-        # ------------------------------------------------------------
-        # 1. Equality hash join: ColumnRef = ColumnRef
-        # ------------------------------------------------------------
-        if (
-            isinstance(on_expr, CompareExpr)
-            and on_expr.op == "="
-            and isinstance(on_expr.field, ColumnRef)
-            and isinstance(on_expr.value, ColumnRef)
-        ):
-            left_col = on_expr.field.name
-            right_col = on_expr.value.name
+        on = join.on
+        if not isinstance(on, InListExpr):
+            raise ValueError(f"Unsupported JOIN ON expression type: {type(on)}")
 
-            # Build hash table for right side
-            hash_table = {}
-            for r in right_rows:
-                key = r.get(right_col)
-                if key is not None:
-                    hash_table.setdefault(key, []).append(r)
+        # ON b._id IN a.source_ids
+        local_field = self._resolve_column(on.list_field)   # a.source_ids
+        # foreign_field = self._resolve_column(on.field)    # b._id (we'll handle via pipeline)
 
-            # Probe left side
-            for L in left_rows:
-                key = L.get(left_col)
-                matches = hash_table.get(key)
+        pipeline = [
+            {
+                "$lookup": {
+                    "from": right_name,
+                    "let": { "src_ids": f"${local_field}" },
+                    "pipeline": [
+                        {
+                            "$addFields": {
+                                "_id_str": { "$toString": "$_id" }
+                            }
+                        },
+                        {
+                            "$match": {
+                                "$expr": { "$in": ["$_id_str", "$$src_ids"] }
+                            }
+                        }
+                    ],
+                    "as": "joined",
+                }
+            },
+            {
+                "$unwind": "$joined"
+            },
+        ]
 
-                if matches:
-                    for R in matches:
-                        merged = self._merge_rows(L, R)
-                        results.append(merged)
-                        if self._limit_reached(results, plan):
-                            return results
-                elif join.join_type == "LEFT":
-                    merged = self._merge_rows(L, {})
-                    results.append(merged)
-                    if self._limit_reached(results, plan):
-                        return results
+        docs = list(base_coll.aggregate(pipeline))
 
-            return results
+        rows = []
+        for d in docs:
+            right_doc = d.pop("joined", {})
+            merged = {**d, **right_doc}
 
-        # ------------------------------------------------------------
-        # 2. IN-list hash join: ColumnRef IN list_field
-        # ------------------------------------------------------------
-        if isinstance(on_expr, InListExpr):
-            field = on_expr.field          # scalar ColumnRef (b._id)
-            list_field = on_expr.list_field  # list ColumnRef (s.primary_source_ids / a.source_ids)
+            # Normalize ObjectId → string
+            if "_id" in merged and isinstance(merged["_id"], ObjectId):
+                merged["_id"] = str(merged["_id"])
 
-            if not isinstance(field, ColumnRef) or not isinstance(list_field, ColumnRef):
-                return self._eval_join_fallback(left_rows, right_rows, compiled_on, join, plan)
+            rows.append(merged)
 
-            scalar_col = field.name
-            list_col = list_field.name
-
-            # Build reverse index: str(element) -> [left rows]
-            reverse_index = {}
-
-            for L in left_rows:
-                lst = L.get(list_col)
-                if isinstance(lst, list):
-                    for val in lst:
-                        key = str(val)
-                        reverse_index.setdefault(key, []).append(L)
-
-            results = []
-
-            # Probe right side using str(key)
-            for R in right_rows:
-                key = R.get(scalar_col)
-                match_key = str(key)
-                matches = reverse_index.get(match_key)
-
-                if matches:
-                    for L in matches:
-                        merged = self._merge_rows(L, R)
-                        results.append(merged)
-                        if self._limit_reached(results, plan):
-                            return results
-                elif join.join_type == "LEFT":
-                    merged = self._merge_rows({}, R)
-                    results.append(merged)
-                    if self._limit_reached(results, plan):
-                        return results
-
-            return results
-
-
-        # ------------------------------------------------------------
-        # 3. List-overlap hash join: list_field OVERLAP list_field
-        # ------------------------------------------------------------
-        if isinstance(on_expr, ListOverlapExpr):
-            left_col = on_expr.field.name
-            right_col = on_expr.list_field.name
-
-            # Build reverse index for left side: element → [rows]
-            reverse_index = {}
-
-            for L in left_rows:
-                lst = L.get(left_col)
-                if isinstance(lst, list):
-                    for val in lst:
-                        reverse_index.setdefault(val, []).append(L)
-
-            # Probe right side
-            for R in right_rows:
-                lst = R.get(right_col)
-                if isinstance(lst, list):
-                    seen = set()
-                    for val in lst:
-                        matches = reverse_index.get(val)
-                        if matches:
-                            for L in matches:
-                                if id(L) not in seen:
-                                    seen.add(id(L))
-                                    merged = self._merge_rows(L, R)
-                                    results.append(merged)
-                                    if self._limit_reached(results, plan):
-                                        return results
-                elif join.join_type == "LEFT":
-                    merged = self._merge_rows({}, R)
-                    results.append(merged)
-                    if self._limit_reached(results, plan):
-                        return results
-
-            return results
-
-        # ------------------------------------------------------------
-        # 4. Fallback: full expression evaluation JOIN
-        # ------------------------------------------------------------
-        return self._eval_join_fallback(left_rows, right_rows, compiled_on, join, plan)
-
-
+        print("DEBUG JOIN ROW SAMPLE:", rows[:3])
+        print("DEBUG JOIN ROW COUNT:", len(rows))
+        return rows
 
     def _eval_join_fallback(self, left_rows, right_rows, compiled_on, join, plan):
         """Fallback nested-loop join with full expression evaluation."""
@@ -2141,29 +2192,30 @@ class SQLToMongoTranslator:
             coll.insert_many(rows)
         return temp_name
     
-    def _eval_table(self, table_ref: TableRef, plan: List[str]) -> List[Dict]:
-        coll_name = table_ref.name
-        plan.append(f"FROM TABLE: {coll_name}")
-        coll = self.mongo.mm_database[coll_name]
-        return list(coll.find({}))
-
     def _eval_table_alias(self, alias, plan):
-        """
-        Evaluate a TableAlias: resolve underlying collection name from alias.source.
-        """
         source = alias.source
-
-        # If it's a TableRef, use its name as the collection name
-        if isinstance(source, TableRef):
-            coll_name = source.name
-        else:
-            # Fallback: if something else, keep existing behavior or raise
-            coll_name = getattr(source, "name", None)
-
-        if coll_name is None:
-            raise RuntimeError(f"Cannot resolve collection name from alias: {alias}")
-
+        coll_name = source.name if isinstance(source, TableRef) else getattr(source, "name", None)
         coll = self.mongo.mm_database[coll_name]
+
+        # If this table participates in a JOIN, prefilter it
+        if isinstance(plan[-1], JoinRef):
+            return self._prefilter_join_table(coll, plan[-1], coll_name)
+
+        rows = list(coll.find({}))
+        for r in rows:
+            if "_id" in r:
+                r["_id"] = str(r["_id"])
+        print("DEBUG TABLE ROW SAMPLE (normalized):", coll_name, rows[:1])
+        return rows
+
+
+    def _eval_table(self, table_ref, plan):
+        coll_name = table_ref.name
+        coll = self.mongo.mm_database[coll_name]
+
+        if isinstance(plan[-1], JoinRef):
+            return self._prefilter_join_table(coll, plan[-1], coll_name)
+
         return list(coll.find({}))
 
     def _eval_subquery(self, select: SelectStmt, plan: List[str]) -> str:
@@ -2333,29 +2385,21 @@ class SQLToMongoTranslator:
                     return False
         return False
     
-    def _merge_rows(self, left_row: dict, right_row: dict) -> dict:
+    def _merge_rows(self, left, right):
         """
-        Merge two MongoDB result rows for JOIN operations.
-        If the right row is empty (LEFT JOIN no match), return left row + empty right fields.
+        Merge two row dictionaries for JOIN output.
+        If right is None (LEFT JOIN no match), keep only left fields and mark missing right.
         """
-        if not isinstance(left_row, dict):
-            left_row = {}
-
-        if not isinstance(right_row, dict):
-            right_row = {}
-
         merged = {}
 
-        # Copy left row fields
-        for k, v in left_row.items():
-            merged[k] = v
+        if isinstance(left, dict):
+            merged.update(left)
 
-        # Copy right row fields, avoiding collisions
-        for k, v in right_row.items():
-            if k in merged:
-                merged[f"right_{k}"] = v
-            else:
-                merged[k] = v
+        if isinstance(right, dict):
+            merged.update(right)
+        else:
+            # Mark that right side was missing (useful for debugging / consumers)
+            merged["_right_missing"] = True
 
         return merged
     
@@ -2415,6 +2459,92 @@ class SQLToMongoTranslator:
 
         compiled = self._compile_expr(on_expr)
         return bool(self._eval_compiled_expr(compiled, merged))
+    
+    def debug_id_intersection(self):
+        db = self.mongo.mm_database
+
+        # Billboard IDs
+        bill_ids = set(str(doc["_id"]) for doc in db["billboard"].find({}, {"_id": 1}))
+
+        # Songs primary_source_ids
+        song_ids = set()
+        for doc in db["songs"].find({}, {"primary_source_ids": 1}):
+            for sid in doc.get("primary_source_ids", []):
+                song_ids.add(str(sid))
+
+        # Artists source_ids
+        artist_ids = set()
+        for doc in db["artists"].find({}, {"source_ids": 1}):
+            for sid in doc.get("source_ids", []):
+                artist_ids.add(str(sid))
+
+        print("bill ∩ songs:", len(bill_ids & song_ids))
+        print("bill ∩ artists:", len(bill_ids & artist_ids))
+
+    def _resolve_column(self, expr):
+        """
+        Resolve a column-like expression to a field name string.
+        Supports:
+        - ColumnRef(table, name)
+        - simple identifier strings
+        """
+        # ColumnRef: use its name
+        if isinstance(expr, ColumnRef):
+            return expr.name
+
+        # Already a string field name
+        if isinstance(expr, str):
+            return expr
+
+        # Fallback: unsupported expression type
+        raise ValueError(f"Unsupported column expression for JOIN: {expr} ({type(expr)})")
+    
+    def _prefilter_join_table(self, coll, join, coll_name):
+        on = join.on
+
+        # Only optimize IN-list JOINs
+        if not isinstance(on, InListExpr):
+            return list(coll.find({}))
+
+        left_field  = self._resolve_column(on.field)       # b._id
+        right_field = self._resolve_column(on.list_field)  # a.source_ids
+
+        # If this is the right side (billboard)
+        if left_field == "_id":
+            # Load only _id and fields needed for projection
+            rows = list(coll.find({}, {"_id": 1, "date": 1, "song": 1,
+                                    "artist": 1, "this_week": 1,
+                                    "peak_position": 1, "weeks_on_chart": 1}))
+            for r in rows:
+                r["_id"] = str(r["_id"])
+            print("DEBUG PREFILTER RIGHT:", coll_name, len(rows))
+            return rows
+
+        # If this is the left side (artists)
+        # Load only artists whose source_ids intersect billboard ids
+        billboard_ids = set(r["_id"] for r in self._eval_table(TableRef("billboard"), []))
+        rows = list(coll.find({"source_ids": {"$in": list(billboard_ids)}}))
+        for r in rows:
+            r["_id"] = str(r["_id"])
+        print("DEBUG PREFILTER LEFT:", coll_name, len(rows))
+        return rows
+    
+    def _normalize_row(self, row):
+        out = {}
+        for k, v in row.items():
+            if isinstance(v, ObjectId):
+                out[k] = str(v)
+            elif isinstance(v, datetime):
+                out[k] = v.isoformat()
+            elif isinstance(v, dict):
+                out[k] = self._normalize_row(v)
+            elif isinstance(v, list):
+                out[k] = [self._normalize_row(x) if isinstance(x, dict) else
+                        (str(x) if isinstance(x, ObjectId) else x)
+                        for x in v]
+            else:
+                out[k] = v
+        return out
 # ---
 # END OF SQLToMongoTranslator
 # ---
