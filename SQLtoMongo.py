@@ -2147,10 +2147,22 @@ class SQLToMongoTranslator:
         coll = self.mongo.mm_database[coll_name]
         return list(coll.find({}))
 
-    
-    def _eval_table_alias(self, table_alias: TableAlias, plan: List[str]) -> List[Dict]:
-        coll_name = table_alias.source.name
-        plan.append(f"FROM TABLE: {coll_name} AS {table_alias.alias}")
+    def _eval_table_alias(self, alias, plan):
+        """
+        Evaluate a TableAlias: resolve underlying collection name from alias.source.
+        """
+        source = alias.source
+
+        # If it's a TableRef, use its name as the collection name
+        if isinstance(source, TableRef):
+            coll_name = source.name
+        else:
+            # Fallback: if something else, keep existing behavior or raise
+            coll_name = getattr(source, "name", None)
+
+        if coll_name is None:
+            raise RuntimeError(f"Cannot resolve collection name from alias: {alias}")
+
         coll = self.mongo.mm_database[coll_name]
         return list(coll.find({}))
 
