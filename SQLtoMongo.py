@@ -2226,6 +2226,47 @@ class SQLToMongoTranslator:
                 merged[k] = v
 
         return merged
+    
+    def _normalize_id(value):
+        """
+        Normalize a value so that ObjectId comparisons work correctly.
+        Converts:
+        - ObjectId -> string
+        - 24-char hex strings -> string
+        - "ObjectId('...')" -> string
+        Leaves all other values unchanged.
+        """
+
+        # Case 1: Already an ObjectId
+        if isinstance(value, ObjectId):
+            return str(value)
+
+        # Case 2: "ObjectId('abc123')" string
+        if isinstance(value, str) and value.startswith("ObjectId("):
+            try:
+                inner = value.split("ObjectId(")[1].strip(")'\"")
+                return inner
+            except Exception:
+                return value
+
+        # Case 3: 24‑hex string (valid ObjectId)
+        if isinstance(value, str) and len(value) == 24:
+            try:
+                ObjectId(value)  # validate
+                return value
+            except Exception:
+                return value
+
+        # Case 4: Lists (normalize each element)
+        if isinstance(value, list):
+            return [normalize_id(v) for v in value]
+
+        # Case 5: Dicts (normalize values)
+        if isinstance(value, dict):
+            return {k: normalize_id(v) for k, v in value.items()}
+
+        # Everything else unchanged
+        return value
 # ---
 # END OF SQLToMongoTranslator
 # ---
