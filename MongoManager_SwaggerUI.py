@@ -207,8 +207,7 @@ def mongo_requires_auth():
         return True
 
 @app.get("/docs", include_in_schema=False)
-def custom_docs():
-    # Always assume secure mode for your environment
+async def custom_docs():
     secure_mode = True
 
     html = f"""
@@ -312,8 +311,15 @@ def custom_docs():
                 dom_id: "#swagger-ui",
                 layout: "BaseLayout",
 
+                requestInterceptor: (req) => {{
+                    const token = localStorage.getItem("authToken");
+                    if (token) {{
+                        req.headers["X-Auth-Token"] = token;
+                    }}
+                    return req;
+                }},
+
                 responseInterceptor: (res) => {{
-                    // Handle HTTP errors
                     if (res.status >= 400) {{
                         let msg = "Unknown error";
 
@@ -323,24 +329,20 @@ def custom_docs():
                             msg = res.statusText;
                         }}
 
-                        // Authentication failure
                         if (res.status === 401) {{
                             switchToLogin(msg);
                             return res;
                         }}
 
-                        // Authorization failure
                         if (res.status === 403) {{
                             showError("Not authorized: " + msg);
                             return res;
                         }}
 
-                        // Other errors
                         showError(msg);
                         return res;
                     }}
 
-                    // Handle FastAPI error payloads inside 200 responses
                     if (res.data && res.data.error) {{
                         showError(res.data.error);
                     }}
@@ -389,6 +391,14 @@ def custom_docs():
             .then(r => r.json())
             .then(data => {{
                 if (data.status === "authenticated") {{
+
+                    if (!data.token) {{
+                        showError("Authentication failed: missing token");
+                        return;
+                    }}
+
+                    localStorage.setItem("authToken", data.token);
+
                     const user = document.getElementById("username").value || "user";
                     const db = document.getElementById("database").value || "db";
 
@@ -396,6 +406,7 @@ def custom_docs():
                     document.getElementById("tab-api").style.display = "block";
                     document.getElementById("tab-api").click();
                     loadSwagger();
+
                 }} else {{
                     showError("Authentication failed");
                 }}
@@ -410,14 +421,23 @@ def custom_docs():
 </html>
 """
 
-    return HTMLResponse(
-        html,
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
-    )
+    return HTMLResponse(html)
     
-def require_auth(credentials: Credentials):
+def require_auth(request: Request):
+    token = request.headers.get("X-Auth-Token")
+
+    if not manager.active_token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if token != manager.active_token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    return manager
+
+@app.post("/authenticate", tags=["Authentication"], summary="Authenticate and connect to MongoDB")
+async def authenticate(credentials: Credentials):
     try:
-        manager.authenticate(
+        authRet = manager.authenticate(
             username=credentials.username,
             password=credentials.password,
             host=credentials.host,
@@ -425,22 +445,20 @@ def require_auth(credentials: Credentials):
             database=credentials.database,
             timeout=credentials.timeout
         )
-        return manager
+
+        secured = bool(credentials.username and credentials.password)
+
+        return {
+            "status": authRet.get("status"),
+            "token": authRet.get("token"),
+            "host": credentials.host,
+            "port": credentials.port,
+            "database": credentials.database,
+            "secure": secured
+        }
+
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
-
-@app.post("/authenticate", tags=["Authentication"], summary="Authenticate and connect to MongoDB")
-def authenticate(credentials: Credentials):
-    require_auth(credentials)
-    secured = bool(credentials.username and credentials.password)
-    return {
-        "status": "authenticated",
-        "host": credentials.host,
-        "port": credentials.port,
-        "database": credentials.database,
-        "secure": secured
-    }
-
 # ---
 # Endpoint and functional interface to determine whether read-only features are active or not
 # ---

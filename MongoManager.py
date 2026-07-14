@@ -43,6 +43,7 @@ from pymongo.errors import OperationFailure, ServerSelectionTimeoutError
 from bson.objectid import ObjectId
 from datetime import datetime
 from pathlib import Path
+import uuid
 import os, gzip
 import json
 
@@ -60,6 +61,7 @@ class MongoManager(object):
         self.mm_database = None
         self.mm_collection = None
         self.authenticated = False
+        self.active_token = None
         # Backup directory (Option 3: env override, default ./backups)
         self.backup_dir = Path(
             os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups"))
@@ -71,17 +73,27 @@ class MongoManager(object):
     # ---
     def authenticate(self, username=None, password=None, host="127.0.0.1", port=27017, database=None, timeout=3000):
 
+        username = username or None
+        password = password or None
+
         try:
             # Always authenticate against admin
-            self.mm_client = MongoClient(
-                host=host,
-                port=port,
-                username=username,
-                password=password,
-                authSource="admin",
-                authMechanism="SCRAM-SHA-256",
-                serverSelectionTimeoutMS=timeout
-            )
+            if not username or not password:
+                self.mm_client = MongoClient(
+                    host=host,
+                    port=port,
+                    serverSelectionTimeoutMS=timeout
+                )
+            else:
+                self.mm_client = MongoClient(
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    authSource="admin",
+                    authMechanism="SCRAM-SHA-256",
+                    serverSelectionTimeoutMS=timeout
+                )
 
             # Force authentication immediately
             self.mm_client.admin.command("ping")
@@ -94,15 +106,17 @@ class MongoManager(object):
             self.authenticated = True
             self.current_user = username
             self.current_db = dbname
-
-            return True
-
+            self.active_token = str(uuid.uuid4())
+            return {"status": "authenticated", "token": self.active_token}
+    
         except OperationFailure as e:
             msg = str(e).lower()
+            self.authenticated = False
+            self.active_token = None
 
             # Wrong username/password
             if "authentication failed" in msg or "auth failed" in msg:
-                return False
+                return {"status": "unauthenticated", "token": None}
 
             # User is authenticated but lacks privileges
             if "not authorized" in msg:
@@ -111,9 +125,13 @@ class MongoManager(object):
             raise
 
         except ServerSelectionTimeoutError:
+            self.authenticated = False
+            self.active_token = None
             raise Exception("Timed out trying to reach server")
 
         except Exception as e:
+            self.authenticated = False
+            self.active_token = None
             raise Exception(f"Authentication failed: {str(e)}")
     # ---
     # This method is used to detect whether the authenticated account has only read access or whether
