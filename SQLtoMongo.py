@@ -2259,11 +2259,11 @@ class SQLToMongoTranslator:
 
         # Case 4: Lists (normalize each element)
         if isinstance(value, list):
-            return [normalize_id(v) for v in value]
+            return [_normalize_id(v) for v in value]
 
         # Case 5: Dicts (normalize values)
         if isinstance(value, dict):
-            return {k: normalize_id(v) for k, v in value.items()}
+            return {k: _normalize_id(v) for k, v in value.items()}
 
         # Everything else unchanged
         return value
