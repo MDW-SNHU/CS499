@@ -97,6 +97,7 @@ translator = SQLToMongoTranslator(manager)  # This will allow passing the manage
 # These handlers should catch most errors without impeding application loading and performance.  It won't handle everything,
 #     but should handle most errors common to the features used in this application
 # ---
+"""
 @app.exception_handler(PyMongoError)
 async def pymongo_exception_handler(request, exc: PyMongoError):
     msg = str(exc)
@@ -136,6 +137,7 @@ async def global_exception_handler(request, exc: Exception):
         status_code=500,
         content={"detail": str(exc)}
     )
+"""
 # ---
 # About Endpoint
 # ---

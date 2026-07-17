@@ -275,6 +275,17 @@ class InListExpr:
     field: Any
     list_field: Any  
 
+@dataclass
+class ListOverlapExpr:
+    left_list: Any      # ColumnRef for the left list field
+    right_list: Any     # ColumnRef for the right list field
+
+@dataclass
+class BoolOpExpr:
+    op: str        # "AND" or "OR"
+    left: Any      # left expression (CompareExpr, ColumnRef, BoolOpExpr, etc.)
+    right: Any     # right expression
+
 # ---
 # LEXER
 # ---
@@ -499,20 +510,20 @@ class Parser:
     def parse_select_item(self) -> Any:
         tok = self._current()
 
-        # Handle "*"
+        # SELECT *
         if tok.type == TokenType.STAR:
             self._advance()
             return "*"
 
-        # Handle subquery in SELECT list:  (SELECT ...)
+        # Subquery in SELECT list: (SELECT ...)
         if tok.type == TokenType.LPAREN:
             self._advance()
-            expr = self.parse_add()
+            expr = self.parse_expr()     # full expression, not parse_add()
             self._expect(TokenType.RPAREN)
             return self._maybe_parse_column_alias(expr)
 
-        # Handle full SQL expressions (identifiers, arithmetic, functions, parentheses, etc.)
-        expr = self.parse_add()
+        # FIX: use parse_primary() instead of parse_add()
+        expr = self.parse_primary()
 
         # Explicit alias: AS alias
         if self._current().type == TokenType.KEYWORD and self._current().value.upper() == "AS":
@@ -525,9 +536,8 @@ class Parser:
             alias = self._advance().value
             return ColumnAlias(expr=expr, alias=alias)
 
-        # No alias
-        return expr
-    
+        return expr 
+   
     def parse_from_source(self) -> Any:
         # Parse the initial table or subquery
         source = self._parse_single_from_source()
@@ -630,6 +640,7 @@ class Parser:
         left = self.parse_and()
         while self._current().type == TokenType.KEYWORD and self._current().value == "OR":
             op = self._advance().value
+            print(dir(op))
             right = self.parse_and()
             left = BinaryExpr(op=op, left=left, right=right)
         return left
@@ -652,33 +663,31 @@ class Parser:
             self._expect(TokenType.RPAREN)
             return inner
 
-        # First parse the left-hand expression (ColumnRef, literal, function, etc.)
-        left = self.parse_add()
+        # FIX: use parse_primary() instead of parse_add()
+        left = self.parse_primary()
 
-        # Now check for IN
+        # IN (...)
         if self._current().type == TokenType.KEYWORD and self._current().value == "IN":
-            self._advance()  # consume IN
+            self._advance()
 
-            # IN (subquery)
             if self._current().type == TokenType.LPAREN:
                 self._advance()
                 sub = self.parse_select()
                 self._expect(TokenType.RPAREN)
                 return InSubqueryExpr(field=left, subquery=sub)
 
-            # IN column/list field
-            right = self.parse_add()
+            right = self.parse_primary()
             return InListExpr(field=left, list_field=right)
 
         # Comparison operator
         tok = self._current()
         if tok.type in (TokenType.EQ, TokenType.LT, TokenType.LTE, TokenType.GT, TokenType.GTE):
             op = self._advance().value
-            right = self.parse_add()
+            right = self.parse_primary()
             return CompareExpr(field=left, op=op, value=right)
 
         raise Exception(f"Unsupported condition starting at {tok.value}")
-
+    
     def parse_value(self) -> Any:
         tok = self._current()
         if tok.type == TokenType.STRING:
@@ -732,7 +741,7 @@ class Parser:
         # Parenthesized expression
         if tok.type == TokenType.LPAREN:
             self._advance()
-            expr = self.parse_add()
+            expr = self.parse_expr()
             self._expect(TokenType.RPAREN)
             return expr
 
@@ -748,31 +757,28 @@ class Parser:
         if tok.type == TokenType.IDENT:
             ident = self._advance().value
 
-            # Function call?
+            # Function call
             if self._current().type == TokenType.LPAREN:
                 self._advance()
                 args = []
-
                 if self._current().type != TokenType.RPAREN:
-                    args.append(self.parse_add())
+                    args.append(self.parse_expr())
                     while self._current().type == TokenType.COMMA:
                         self._advance()
-                        args.append(self.parse_add())
-
+                        args.append(self.parse_expr())
                 self._expect(TokenType.RPAREN)
                 return FuncExpr(name=ident, args=args)
 
-            # Dotted identifier: table.column
+            # Dotted identifier → ColumnRef(table, name)
             if self._current().type == TokenType.DOT:
-                self._advance()  # consume '.'
+                self._advance()
                 field = self._expect(TokenType.IDENT).value
                 return ColumnRef(table=ident, name=field)
 
-            # Simple identifier
+            # Simple identifier → ColumnRef(name)
             return ColumnRef(name=ident)
 
         raise Exception(f"Unexpected token in expression: {tok.value}")
-
     # ---
     # INSERT
     # ---
@@ -1309,7 +1315,7 @@ class SQLToMongoTranslator:
             return self._convert_object_ids(unique)
 
         # Projection / Aggregates
-        final = self._apply_projection(stmt.fields, docs, plan)
+        final = self._apply_projection(docs, stmt.fields, plan)
         final = self._convert_object_ids(final)
         return final
 
@@ -1366,11 +1372,9 @@ class SQLToMongoTranslator:
             left_is_expr = not isinstance(left, str)
             right_is_expr = not isinstance(right, (str, int, float))
 
-            # If either side is an expression → use $expr
             if left_is_expr or right_is_expr:
                 return self._compile_where_expr(expr, plan)
 
-            # Otherwise fall back to simple comparison
             return self._compile_simple_compare(expr, plan)
 
         if isinstance(expr, LikeExpr):
@@ -1381,53 +1385,40 @@ class SQLToMongoTranslator:
             plan.append("WHERE IN (subquery) → materializing")
             temp_name = self._materialize_subquery(expr.subquery, plan)
             temp_coll = self.mongo.mm_database[temp_name]
-            vals = []
-            for d in temp_coll.find():
-                vals.append(d.get(expr.subquery.fields[0]))
+            vals = [d.get(expr.subquery.fields[0]) for d in temp_coll.find()]
             return {expr.field: {"$in": vals}}
+
+        # ⭐ NEW: support IN-list expressions
+        if isinstance(expr, InListExpr):
+            compiled_left = self._compile_expr(expr.field)
+            compiled_right = self._compile_expr(expr.list_field)
+            return {"$expr": {"$in": [compiled_left, compiled_right]}}
 
         raise Exception("Unsupported WHERE expression type")
 
     # ---
     # PROJECTION & AGGREGATES
     # ---
-    def _apply_projection(self, fields, docs, plan):
-        projected = []
+    def _apply_projection(self, rows, fields, plan):
+        results = []
 
-        for d in docs:
-            row = {}
+        for row in rows:
+            out = {}
 
             for f in fields:
-                # Wildcard
-                if f == "*":
-                    for k, v in d.items():
-                        row[k] = v
-                    continue
-
-                # ColumnAlias: use alias as key
                 if isinstance(f, ColumnAlias):
                     alias = f.alias
-                    expr = f.expr
+                    compiled = self._compile_expr(f.expr)
+                    value = self._eval_compiled_expr(compiled, row)
+                    out[alias] = value
+                else:
+                    compiled = self._compile_expr(f)
+                    value = self._eval_compiled_expr(compiled, row)
+                    out[f.name] = value
 
-                    compiled = self._compile_expr(expr)
-                    row[alias] = self._eval_compiled_expr(compiled, d)
+            results.append(out)
 
-                    continue
-
-                # Plain field name
-                if isinstance(f, str):
-                    row[f] = d.get(f)
-                    continue
-
-            projected.append(row)
-
-        return projected
-
-    # ---
-    # SQL RECONSTRUCTION (for debugging)
-    # ---
-    def _reconstruct_sql(self, stmt: SelectStmt) -> str:
-        return "<SQL reconstruction omitted>"
+        return results
 
     # ---
     # INSERT EXECUTION
@@ -1723,16 +1714,13 @@ class SQLToMongoTranslator:
             cleaned.append(new_doc)
         return cleaned
     
-    def _maybe_convert_objectid(self, field, value):
-        if field == "_id" and isinstance(value, str):
-            if len(value) == 24:
-                try:
-                    return(ObjectId(value))
-                except Exception:
-                    return(value)
-        return value
-
     def _eval_select_pipeline(self, stmt, plan):
+        """
+        Correct pipeline execution:
+        - MongoDB handles WHERE, ORDER BY, LIMIT
+        - Python handles SELECT projection (expressions, ColumnRef, aliases)
+        """
+
         pipeline = []
         rows = self._eval_from_source(stmt.from_source, plan)
         temp_name = self._materialize_temp(rows)
@@ -1743,25 +1731,6 @@ class SQLToMongoTranslator:
             mongo_filter = self._compile_where(stmt.where, plan)
             pipeline.append({"$match": mongo_filter})
 
-        # PROJECT
-        proj = {}
-
-        for f in stmt.fields:
-            if isinstance(f, ColumnAlias):
-                proj[f.alias] = self._compile_expr(f.expr)
-            elif isinstance(f, str):
-                proj[f] = f"${f}"
-            elif f == "*":
-                # Expand later if needed
-                pass
-
-        # Always remove _id to avoid ObjectId serialization errors
-        proj["_id"] = 0
-
-        pipeline.append({"$project": proj})
-        _log_debug(f"project stage: {proj}")
-        print(f"project stage: {proj}")
-
         # ORDER BY
         if stmt.order_by:
             sort = {field: direction for field, direction in stmt.order_by}
@@ -1770,91 +1739,116 @@ class SQLToMongoTranslator:
         # LIMIT
         if stmt.limit:
             pipeline.append({"$limit": stmt.limit})
-        
-        docs = base_coll.aggregate(pipeline)
-        docs = list(docs)
 
-        return list(docs)
-    
+        # Run pipeline
+        docs = list(base_coll.aggregate(pipeline))
+
+        # ------------------------------------------------------------
+        # Python-side projection (fixes dict.name errors)
+        # ------------------------------------------------------------
+        results = []
+
+        for row in docs:
+            out = {}
+
+            for f in stmt.fields:
+
+                # SELECT *
+                if f == "*":
+                    for k, v in row.items():
+                        if k != "_id":
+                            out[k] = v
+                    continue
+
+                # SELECT expr AS alias
+                if isinstance(f, ColumnAlias):
+                    alias = f.alias
+                    compiled = self._compile_expr(f.expr)
+                    value = self._eval_compiled_expr(compiled, row)
+                    out[alias] = value
+                    continue
+
+                # SELECT column
+                if isinstance(f, ColumnRef):
+                    compiled = self._compile_expr(f)
+                    value = self._eval_compiled_expr(compiled, row)
+                    out[f.name] = value
+                    continue
+
+                # SELECT literal or identifier
+                compiled = self._compile_expr(f)
+                value = self._eval_compiled_expr(compiled, row)
+                out[str(f)] = value
+
+            results.append(out)
+
+        return results
+
     def _compile_expr(self, expr):
-        try:
-            _log_debug(f"COMPILE EXPR: {expr} ({type(expr)})")
+#        print("DEBUG COMPILE EXPR:", expr, type(expr))
+        if isinstance(expr, ColumnRef):
+            # ("column", "title")
+            return ("column", expr.name)
+        # --------------------------------------------------------
+        # Literal (string, number, bool, None)
+        # --------------------------------------------------------
+        if isinstance(expr, (str, int, float, bool)) or expr is None:
+            return ("literal", expr)
 
-            # Numeric literal
-            if isinstance(expr, (int, float)):
-                return expr
-            
-            # Literal string or simple identifier
-            if isinstance(expr, str):
-                # In this engine, strings in expressions are treated as
-                # field references when used in projection.
-                return f"${expr}"
+        # --------------------------------------------------------
+        # Unary expression (NOT, unary -)
+        # --------------------------------------------------------
+        if isinstance(expr, UnaryExpr):
+            op = expr.op.upper()
+            compiled_inner = self._compile_expr(expr.expr)
+            return ("unary", op, compiled_inner)
 
-            # Column reference (qualified or unqualified)
-            if isinstance(expr, ColumnRef):
-                return f"${expr.name}"
+        # --------------------------------------------------------
+        # Boolean expression (AND / OR)
+        # --------------------------------------------------------
+        if isinstance(expr, BoolOpExpr):
+            op = expr.op.upper()  # "AND" / "OR"
+            left = self._compile_expr(expr.left)
+            right = self._compile_expr(expr.right)
+            return ("bool", op, left, right)
 
-            # Arithmetic expression
-            if isinstance(expr, ArithExpr):
-                left = self._compile_expr(expr.left)
-                right = self._compile_expr(expr.right)
+        # --------------------------------------------------------
+        # Comparison expression (=, !=, <, <=, >, >=)
+        # --------------------------------------------------------
+        if isinstance(expr, CompareExpr):
+            op = expr.op
+            left = self._compile_expr(expr.field)
+            right = self._compile_expr(expr.value)
+            return ("compare", op, left, right)
 
-                if expr.op == "+":
-                    return {"$add": [left, right]}
-                if expr.op == "-":
-                    return {"$subtract": [left, right]}
-                if expr.op == "*":
-                    return {"$multiply": [left, right]}
-                if expr.op == "/":
-                    return {"$divide": [left, right]}
+        # --------------------------------------------------------
+        # IN-list expression (scalar IN list)
+        # --------------------------------------------------------
+        if isinstance(expr, InListExpr):
+            left = self._compile_expr(expr.field)
+            right = self._compile_expr(expr.list_field)
+            return ("in_list", left, right)
 
-            # Unary expression
-            if isinstance(expr, UnaryExpr):
-                operand = self._compile_expr(expr.operand)
-                if expr.op == "-":
-                    return {"$multiply": [-1, operand]}
-                if expr.op == "NOT":
-                    return {"$not": [operand]}
+        # --------------------------------------------------------
+        # List-overlap expression (list IN list / overlaps)
+        # --------------------------------------------------------
+        if isinstance(expr, ListOverlapExpr):
+            left = self._compile_expr(expr.left_list)
+            right = self._compile_expr(expr.right_list)
+            return ("list_overlap", left, right)
 
-            # Function call
-            if isinstance(expr, FuncExpr):
-                name = expr.name.upper()
-                args = [self._compile_expr(a) for a in expr.args]
+        # --------------------------------------------------------
+        # Function expression (LOWER, UPPER, LENGTH, etc.)
+        # --------------------------------------------------------
+        if isinstance(expr, FuncExpr):
+            name = expr.name.upper()
+            args = [self._compile_expr(a) for a in expr.args]
+            return ("func", name, args)
 
-                if name == "ABS":
-                    return {"$abs": args[0]}
-                if name == "LOWER":
-                    return {"$toLower": args[0]}
-                if name == "UPPER":
-                    return {"$toUpper": args[0]}
-                if name == "ROUND":
-                    # ROUND(x) or ROUND(x, n)
-                    if len(args) == 1:
-                        return {"$round": [args[0], 0]}
-                    return {"$round": args}
-                if name == "FLOOR":
-                    return {"$floor": args[0]}
-                if name == "CEIL":
-                    return {"$ceil": args[0]}
-                if name == "SQRT":
-                    return {"$sqrt": args[0]}
-                if name == "EXP":
-                    return {"$exp": args[0]}
-                if name == "LOG":
-                    # LOG(x) → natural log
-                    return {"$ln": args[0]}
-                if name == "POWER" or name == "POW":
-                    return {"$pow": args}
-                if name == "CONCAT":
-                    return {"$concat": args}
-
-            raise Exception(f"Unsupported expression type: {expr}")
-
-        except Exception as e:
-            _log_debug(f"EXPR ERROR: {e}")
-            raise
-
-        return None
+        # --------------------------------------------------------
+        # Fallback: treat as literal
+        # --------------------------------------------------------
+        return ("literal", expr)
     
     def _compile_where_expr(self, expr, plan):
         _log_debug(f"WHERE EXPR: {expr}")
@@ -1966,159 +1960,180 @@ class SQLToMongoTranslator:
             return CompareExpr(field=expr.value, op=expr.op, value=expr.field)
         return expr
     
-    def _eval_join(self, join: JoinRef, plan: List[str]) -> List[Dict]:
+    def _eval_join(self, join, plan):
+        """
+        Full hash-join engine with support for:
+        - ColumnRef = ColumnRef (equality hash join)
+        - ColumnRef IN list_field (reverse-index hash join)
+        - list_field OVERLAP list_field (set-intersection hash join)
+        - full expression fallback
+        - INNER and LEFT JOIN
+        - LIMIT short-circuiting
+        """
+
         left_rows = self._eval_from_source(join.left, plan)
         right_rows = self._eval_from_source(join.right, plan)
-
-        plan.append(f"JOIN TYPE: {join.join_type}")
-
-        # ------------------------------------------------------------
-        # Determine join type: equality or IN-list
-        # ------------------------------------------------------------
         on_expr = join.on
 
-        # Case 1: Equality join: a.id = b.id
-        if isinstance(on_expr, CompareExpr) and on_expr.op == "=":
-            left_col = on_expr.field
-            right_col = on_expr.value
+        # Precompile ON expression once
+        compiled_on = self._compile_expr(on_expr)
 
-            # Build hash table on right side
+        results = []
+
+        # ------------------------------------------------------------
+        # 1. Equality hash join: ColumnRef = ColumnRef
+        # ------------------------------------------------------------
+        if (
+            isinstance(on_expr, CompareExpr)
+            and on_expr.op == "="
+            and isinstance(on_expr.field, ColumnRef)
+            and isinstance(on_expr.value, ColumnRef)
+        ):
+            left_col = on_expr.field.name
+            right_col = on_expr.value.name
+
+            # Build hash table for right side
             hash_table = {}
             for r in right_rows:
-                key = r.get(right_col.name)
-                hash_table.setdefault(key, []).append(r)
+                key = r.get(right_col)
+                if key is not None:
+                    hash_table.setdefault(key, []).append(r)
 
-            # Perform join
-            results = []
+            # Probe left side
             for L in left_rows:
-                left_key = L.get(left_col.name)
-                matches = hash_table.get(left_key)
+                key = L.get(left_col)
+                matches = hash_table.get(key)
 
                 if matches:
                     for R in matches:
-                        results.append(self._merge_rows(L, R))
+                        merged = self._merge_rows(L, R)
+                        results.append(merged)
+                        if self._limit_reached(results, plan):
+                            return results
                 elif join.join_type == "LEFT":
-                    results.append(self._merge_rows(L, {}))
-
-                # Early LIMIT
-                if self._limit_reached(results, plan):
-                    return results
+                    merged = self._merge_rows(L, {})
+                    results.append(merged)
+                    if self._limit_reached(results, plan):
+                        return results
 
             return results
 
-        # Case 2: IN-list join: a.id IN b.list_field
+        # ------------------------------------------------------------
+        # 2. IN-list hash join: ColumnRef IN list_field
+        # ------------------------------------------------------------
         if isinstance(on_expr, InListExpr):
-            left_col = on_expr.field
-            right_col = on_expr.list_field
+            field = on_expr.field          # scalar ColumnRef (b._id)
+            list_field = on_expr.list_field  # list ColumnRef (s.primary_source_ids / a.source_ids)
 
-            # Build hash table: normalized right_list_value -> right_row
-            hash_table = {}
-            for r in right_rows:
-                lst = r.get(right_col.name)
-#                for k, v in r.items():
-#                    print(f"{k}: {v}")
-                if isinstance(lst, list):
-                    for item in lst:
-#                        print("RIGHT_ITEM:", item, type(item))
-                        # Normalize item to string
-                        item = str(item)
-                        hash_table.setdefault(item, []).append(r)
-                                                
-            results = []
+            if not isinstance(field, ColumnRef) or not isinstance(list_field, ColumnRef):
+                return self._eval_join_fallback(left_rows, right_rows, compiled_on, join, plan)
+
+            scalar_col = field.name
+            list_col = list_field.name
+
+            # Build reverse index: str(element) -> [left rows]
+            reverse_index = {}
+
             for L in left_rows:
-                left_key = L.get(left_col.name)
+                lst = L.get(list_col)
+                if isinstance(lst, list):
+                    for val in lst:
+                        key = str(val)
+                        reverse_index.setdefault(key, []).append(L)
 
-#                print("LEFT_KEY:", left_key, type(left_key))
+            results = []
 
-                # Normalize left_key to string
-                left_key = str(left_key)
-
-                matches = hash_table.get(left_key)
-#                print(left_key)
-#                for k, v in hash_table.items():
-#                    print(f"{k}: {len(v)}")
-#                print("Hash: ", hash_table.get(left_key))
-#                sys.exit(0)
-
-#                print("Matches: ", matches)
+            # Probe right side using str(key)
+            for R in right_rows:
+                key = R.get(scalar_col)
+                match_key = str(key)
+                matches = reverse_index.get(match_key)
 
                 if matches:
-                    for R in matches:
-
-#                        print("RIGHT_ITEM:", item, type(item))
-
-                        results.append(self._merge_rows(L, R))
+                    for L in matches:
+                        merged = self._merge_rows(L, R)
+                        results.append(merged)
+                        if self._limit_reached(results, plan):
+                            return results
                 elif join.join_type == "LEFT":
-                    results.append(self._merge_rows(L, {}))
-
-                if self._limit_reached(results, plan):
-                    return results
+                    merged = self._merge_rows({}, R)
+                    results.append(merged)
+                    if self._limit_reached(results, plan):
+                        return results
 
             return results
 
-        # Unsupported join type
-        raise Exception("JOIN ON clause must be a simple equality or IN-list condition.")
-    
-    def _eval_join_condition(self, expr: Any, L: Dict, R: Dict) -> bool:
-        return bool(self._eval_condition_expr(expr, L, R))
+
+        # ------------------------------------------------------------
+        # 3. List-overlap hash join: list_field OVERLAP list_field
+        # ------------------------------------------------------------
+        if isinstance(on_expr, ListOverlapExpr):
+            left_col = on_expr.field.name
+            right_col = on_expr.list_field.name
+
+            # Build reverse index for left side: element → [rows]
+            reverse_index = {}
+
+            for L in left_rows:
+                lst = L.get(left_col)
+                if isinstance(lst, list):
+                    for val in lst:
+                        reverse_index.setdefault(val, []).append(L)
+
+            # Probe right side
+            for R in right_rows:
+                lst = R.get(right_col)
+                if isinstance(lst, list):
+                    seen = set()
+                    for val in lst:
+                        matches = reverse_index.get(val)
+                        if matches:
+                            for L in matches:
+                                if id(L) not in seen:
+                                    seen.add(id(L))
+                                    merged = self._merge_rows(L, R)
+                                    results.append(merged)
+                                    if self._limit_reached(results, plan):
+                                        return results
+                elif join.join_type == "LEFT":
+                    merged = self._merge_rows({}, R)
+                    results.append(merged)
+                    if self._limit_reached(results, plan):
+                        return results
+
+            return results
+
+        # ------------------------------------------------------------
+        # 4. Fallback: full expression evaluation JOIN
+        # ------------------------------------------------------------
+        return self._eval_join_fallback(left_rows, right_rows, compiled_on, join, plan)
 
 
-    def _eval_condition_expr(self, expr: Any, L: Dict, R: Dict) -> Any:
-        # BinaryExpr (AND / OR)
-        if isinstance(expr, BinaryExpr):
-            left = self._eval_condition_expr(expr.left, L, R)
-            right = self._eval_condition_expr(expr.right, L, R)
-            if expr.op == "AND":
-                return bool(left) and bool(right)
-            if expr.op == "OR":
-                return bool(left) or bool(right)
 
-        # CompareExpr
-        if isinstance(expr, CompareExpr):
-            left = self._eval_value_expr(expr.field, L, R)
-            right = self._eval_value_expr(expr.value, L, R)
-            op = expr.op
-            if op == "=":
-                return left == right
-            if op == "<":
-                return left < right
-            if op == "<=":
-                return left <= right
-            if op == ">":
-                return left > right
-            if op == ">=":
-                return left >= right
-            return False
+    def _eval_join_fallback(self, left_rows, right_rows, compiled_on, join, plan):
+        """Fallback nested-loop join with full expression evaluation."""
+        results = []
 
-        # Fallback: treat as truthy
-        return bool(self._eval_value_expr(expr, L, R))
-    
-    def _eval_value_expr(self, expr: Any, L: Dict, R: Dict) -> Any:
-        if isinstance(expr, str):
-            if "." in expr:
-                alias, field = expr.split(".", 1)
-                # try left then right
-                if alias in L and field in L:
-                    return L[field]
-                if alias in R and field in R:
-                    return R[field]
-                return None
-            # unqualified
-            if expr in L:
-                return L[expr]
-            if expr in R:
-                return R[expr]
-            return None
+        for L in left_rows:
+            matched = False
 
-        if isinstance(expr, ArithExpr) or isinstance(expr, UnaryExpr) or isinstance(expr, FuncExpr):
-            return None
+            for R in right_rows:
+                merged = self._merge_rows(L, R)
 
-        # Literal
-        if isinstance(expr, (int, float)):
-            return expr
+                if self._eval_compiled_expr(compiled_on, merged):
+                    results.append(merged)
+                    matched = True
+                    if self._limit_reached(results, plan):
+                        return results
 
-        return None
-    
+            if not matched and join.join_type == "LEFT":
+                merged = self._merge_rows(L, {})
+                results.append(merged)
+                if self._limit_reached(results, plan):
+                    return results
+
+        return results
+           
     def _materialize_temp(self, rows: List[Dict]) -> str:
         temp_name = f"_tmp_join_{uuid.uuid4().hex[:8]}"
         coll = self.mongo.mm_database[temp_name]
@@ -2146,32 +2161,137 @@ class SQLToMongoTranslator:
         return list(coll.find({}))
     
     def _eval_compiled_expr(self, compiled, row):
-        # Literal number
-        if isinstance(compiled, (int, float)):
-            return compiled
+        """
+        Evaluate a compiled expression against a single row dict.
+        """
 
-        # Simple field reference: "$title"
-        if isinstance(compiled, str) and compiled.startswith("$"):
-            field = compiled[1:]
-            return row.get(field)
+        tag = compiled[0]
 
-        # Arithmetic: {"$add": [left, right]}
-        if isinstance(compiled, dict) and "$add" in compiled:
-            left, right = compiled["$add"]
-            return self._eval_compiled_expr(left, row) + self._eval_compiled_expr(right, row)
+        # --------------------------------------------------------
+        # Column reference
+        # --------------------------------------------------------
+        if tag == "column":
+            colname = compiled[1]
+            return row.get(colname)
 
-        if isinstance(compiled, dict) and "$subtract" in compiled:
-            left, right = compiled["$subtract"]
-            return self._eval_compiled_expr(left, row) - self._eval_compiled_expr(right, row)
+        # --------------------------------------------------------
+        # Literal
+        # --------------------------------------------------------
+        if tag == "literal":
+            return compiled[1]
 
-        if isinstance(compiled, dict) and "$multiply" in compiled:
-            left, right = compiled["$multiply"]
-            return self._eval_compiled_expr(left, row) * self._eval_compiled_expr(right, row)
+        # --------------------------------------------------------
+        # Unary (NOT, unary -)
+        # --------------------------------------------------------
+        if tag == "unary":
+            op = compiled[1]
+            inner = self._eval_compiled_expr(compiled[2], row)
 
-        if isinstance(compiled, dict) and "$divide" in compiled:
-            left, right = compiled["$divide"]
-            return self._eval_compiled_expr(left, row) / self._eval_compiled_expr(right, row)
+            if op == "NOT":
+                return not bool(inner)
+            if op == "-":
+                return -inner
+            return inner
 
+        # --------------------------------------------------------
+        # Boolean (AND / OR)
+        # --------------------------------------------------------
+        if tag == "bool":
+            op = compiled[1]
+            left = self._eval_compiled_expr(compiled[2], row)
+            right = self._eval_compiled_expr(compiled[3], row)
+
+            if op == "AND":
+                return bool(left) and bool(right)
+            if op == "OR":
+                return bool(left) or bool(right)
+            return False
+
+        # --------------------------------------------------------
+        # Comparison (=, !=, <, <=, >, >=)
+        # --------------------------------------------------------
+        if tag == "compare":
+            op = compiled[1]
+            left = self._eval_compiled_expr(compiled[2], row)
+            right = self._eval_compiled_expr(compiled[3], row)
+
+            if op == "=":
+                return left == right
+            if op == "!=":
+                return left != right
+            if op == "<":
+                return left < right
+            if op == "<=":
+                return left <= right
+            if op == ">":
+                return left > right
+            if op == ">=":
+                return left >= right
+            return False
+
+        # --------------------------------------------------------
+        # IN-list (scalar IN list)
+        # --------------------------------------------------------
+        if tag == "in_list":
+            left = self._eval_compiled_expr(compiled[1], row)
+            right = self._eval_compiled_expr(compiled[2], row)
+
+            if not isinstance(right, list):
+                return False
+
+            return str(left) in [str(x) for x in right]
+
+        # --------------------------------------------------------
+        # List-overlap (list IN list / overlaps)
+        # --------------------------------------------------------
+        if tag == "list_overlap":
+            left = self._eval_compiled_expr(compiled[1], row)
+            right = self._eval_compiled_expr(compiled[2], row)
+
+            if not isinstance(left, list) or not isinstance(right, list):
+                return False
+
+            left_set = {str(x) for x in left}
+            right_set = {str(x) for x in right}
+            return len(left_set & right_set) > 0
+
+        # --------------------------------------------------------
+        # Function expression
+        # --------------------------------------------------------
+        if tag == "func":
+            name = compiled[1]
+            args = [self._eval_compiled_expr(a, row) for a in compiled[2]]
+
+            if name == "LOWER":
+                return str(args[0]).lower()
+            if name == "UPPER":
+                return str(args[0]).upper()
+            if name == "LENGTH":
+                return len(str(args[0]))
+            # extend with more functions as needed
+            return None
+
+        # --------------------------------------------------------
+        # Arithmetic expression (+, -, *, /)
+        # --------------------------------------------------------
+        if tag == "arith":
+            op = compiled[1]
+            left = self._eval_compiled_expr(compiled[2], row)
+            right = self._eval_compiled_expr(compiled[3], row)
+
+            if op == "+":
+                return left + right
+            if op == "-":
+                return left - right
+            if op == "*":
+                return left * right
+            if op == "/":
+                return left / right if right not in (0, None) else None
+            return None
+
+        # --------------------------------------------------------
+        # Fallback
+        # --------------------------------------------------------
         return None
     
     def _cleanup_temp_collections(self):
@@ -2267,6 +2387,22 @@ class SQLToMongoTranslator:
 
         # Everything else unchanged
         return value
+
+    def _colname(self, colref):
+        if hasattr(colref, "name"):
+            return colref.name
+        raise Exception("Unknown ColumnRef format")
+
+    def _eval_on_condition(self, on_expr, left_row, right_row):
+        # Merge left and right into a single row for expression evaluation
+        merged = {}
+        if isinstance(left_row, dict):
+            merged.update(left_row)
+        if isinstance(right_row, dict):
+            merged.update(right_row)
+
+        compiled = self._compile_expr(on_expr)
+        return bool(self._eval_compiled_expr(compiled, merged))
 # ---
 # END OF SQLToMongoTranslator
 # ---
